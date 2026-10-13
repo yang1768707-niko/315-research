@@ -1,0 +1,17 @@
+# IDE-generated build products; preserve sources and project configuration.
+/Debug/
+/Release/
+/.metadata/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
