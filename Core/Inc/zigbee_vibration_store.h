@@ -44,5 +44,9 @@ int ZigbeeVibrationStore_DiscardPending(void);
 /* Persistently invalidate every slot without erasing waveform data. */
 HAL_StatusTypeDef ZigbeeVibrationStore_ResetRecords(void);
 unsigned ZigbeeVibrationStore_FreeSlots(void);
+#define ZIGBEE_BATCH_METADATA_MAX 192U
+int ZigbeeVibrationStore_SaveMetadata(uint32_t batch, const void *data, uint16_t length);
+/* 1 valid record, 0 old batch without metadata, -1 read/CRC/format error. */
+int ZigbeeVibrationStore_LoadMetadata(uint32_t batch, void *data, uint16_t length);
 
 #endif /* ZIGBEE_VIBRATION_STORE_H */

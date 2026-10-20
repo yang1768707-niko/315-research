@@ -1,7 +1,7 @@
 #ifndef VIBRATION_TX_H
 #define VIBRATION_TX_H
 #include "vibration_codec.h"
-/* Historic single-node block transfer: no clock correction or airtime leases. */
+/* Block completion is pushed; BATCH/WAIT supplies a relative queue delay. */
 
 #define V2_TX_IDLE 0
 #define V2_TX_BATCH 1
@@ -42,7 +42,7 @@ static inline void v2_tx_radio_result(V2Tx *t,int success,uint32_t now) {
     (void)now;
     if(v2_tx_active(t) && !success)++t->radio_failures;
 }
-/* Only a full receiver table can return WAIT; no airtime queue is used. */
+/* The RTC wake event calls resume: it still sends BATCH to reapply, not data. */
 static inline void v2_tx_resume(V2Tx *t,uint32_t now) {
     if(t->deferred){t->deferred=0;t->next_ms=now;t->deadline_ms=now+V2_SEND_STALL_MS;}
 }
@@ -66,14 +66,17 @@ static inline void v2_tx_receive(V2Tx *t,const uint8_t *p,size_t n,uint32_t now)
        v2_u32(p+2)!=v2_u32(t->batch+1))return;
     unsigned kind=p[1],status=p[8],block=v2_u16(p+6);
     unsigned expected=t->phase==V2_TX_BATCH?V2_KIND_BATCH:
-        t->phase==V2_TX_BLOCK?V2_KIND_BLOCK:t->phase==V2_TX_WINDOW?V2_KIND_WINDOW:
+        t->phase==V2_TX_BLOCK?V2_KIND_BLOCK:
+        (t->phase==V2_TX_WINDOW || t->phase==V2_TX_STREAM)?V2_KIND_WINDOW:
         t->phase==V2_TX_FINAL?V2_KIND_FINAL:0;
-    if(kind!=expected || !t->waiting ||
+    /* A complete block can arrive before the final APS send callback. */
+    if((kind!=expected && !(kind==V2_KIND_BLOCK && t->phase==V2_TX_STREAM)) ||
+       (!t->waiting && t->phase!=V2_TX_STREAM) ||
        ((kind==V2_KIND_BLOCK || kind==V2_KIND_WINDOW) && block!=t->index))return;
     if(status==V2_WAIT && (kind==V2_KIND_BATCH || kind==V2_KIND_BLOCK)) {
         uint32_t delay=v2_u32(p+9);
         if(delay<100U)delay=100U;
-        if(delay>5000U)delay=5000U;
+        if(delay>1800000U)delay=1800000U;
         t->waiting=0;t->tries=0;t->deferred=1;++t->wait_count;
         t->next_ms=now+delay;t->deadline_ms=t->next_ms+V2_SEND_STALL_MS;return;
     }
@@ -86,7 +89,7 @@ static inline void v2_tx_receive(V2Tx *t,const uint8_t *p,size_t n,uint32_t now)
     if(status==V2_STORE_FAILED)return; /* retry at bounded ACK timeout */
     if(kind==V2_KIND_BATCH && status==V2_OK){v2_tx_phase(t,V2_TX_PREPARE,now);return;}
     if(kind==V2_KIND_BLOCK && status==V2_BLOCK_DONE){v2_tx_next_block(t,now);return;}
-    if(kind==V2_KIND_BLOCK && status==V2_OK) {
+    if(kind==V2_KIND_BLOCK && status==V2_OK && t->phase==V2_TX_BLOCK) {
         t->missing=v2_mask(t->fragments);t->fragment=0;
         v2_tx_phase(t,V2_TX_STREAM,now);return;
     }
@@ -98,6 +101,7 @@ static inline void v2_tx_receive(V2Tx *t,const uint8_t *p,size_t n,uint32_t now)
     if(kind==V2_KIND_WINDOW && status==V2_MISSING) {
         uint64_t missing=v2_u64(p+9);
         if(!missing || (missing&~v2_mask(t->fragments)))return;
+        if(t->phase==V2_TX_STREAM && t->block_repairs && missing==t->missing)return;
         if(++t->block_repairs>V2_RETRIES){t->phase=V2_TX_ERROR;return;}
         t->missing=missing;t->fragment=0;t->waiting=0;t->phase=V2_TX_STREAM;
         t->next_ms=now;t->deadline_ms=now+V2_SEND_STALL_MS;return;
@@ -138,8 +142,9 @@ static inline void v2_tx_poll(V2Tx *t, const V2TxIO *io,uint32_t now) {
     else if(t->phase==V2_TX_STREAM) {
         while(t->fragment<t->fragments && !(t->missing&(UINT64_C(1)<<t->fragment)))++t->fragment;
         if(t->fragment>=t->fragments) {
-            t->phase=V2_TX_WINDOW;t->waiting=0;t->next_ms=now+100U;
-            t->deadline_ms=now+V2_SEND_STALL_MS;return;
+            /* Normal path waits for the receiver's pushed bitmap/OK, not a query. */
+            t->phase=V2_TX_WINDOW;t->waiting=1;t->next_ms=now;
+            t->deadline_ms=now+V2_ACK_TIMEOUT_MS;return;
         }
         unsigned offset=(unsigned)t->fragment*V2_FRAGMENT_BYTES;
         unsigned count=t->encoded_len-offset;
@@ -161,6 +166,11 @@ static inline void v2_tx_poll(V2Tx *t, const V2TxIO *io,uint32_t now) {
     }
     t->sent_bytes+=(uint32_t)length;++t->sent_packets;
     if(command==V2_DATA){++t->fragment;t->deadline_ms=now+V2_SEND_STALL_MS;}
-    else {t->waiting=1;t->deadline_ms=now+V2_ACK_TIMEOUT_MS;}
+    else if(command==V2_BLOCK && t->index!=0U) {
+        /* The preceding block OK already permits this block. Keep metadata,
+         * but do not perform another ordinary permission round trip. */
+        t->missing=v2_mask(t->fragments);t->fragment=0;
+        v2_tx_phase(t,V2_TX_STREAM,now);t->next_ms=now+V2_PACE_MS;
+    } else {t->waiting=1;t->deadline_ms=now+V2_ACK_TIMEOUT_MS;}
 }
 #endif

@@ -18,6 +18,12 @@
 #define ZB_VIB_FEATURE_OFFSET       512U
 #define ZB_VIB_POLICY_OFFSET        1024U
 #define ZB_VIB_FEATURE_MAGIC        0x46545232UL
+#define ZB_VIB_METADATA_OFFSET      1280U
+#define ZB_VIB_METADATA_MAGIC       0x534e5031UL
+typedef struct {
+  uint32_t magic, length, crc;
+  uint8_t payload[ZIGBEE_BATCH_METADATA_MAX];
+} ZigbeeBatchMetadata;
 
 typedef struct {
   uint32_t magic;
@@ -452,6 +458,44 @@ int ZigbeeVibrationStore_DescribeBatch(uint32_t batch,
 int ZigbeeVibrationStore_Pending(uint8_t descriptor[V2_BATCH_LEN])
 {
   return ZigbeeVibrationStore_DescribeBatch(0U, descriptor);
+}
+
+int ZigbeeVibrationStore_LoadMetadata(uint32_t batch,void *data,uint16_t length)
+{
+  if(!data || !length || length>ZIGBEE_BATCH_METADATA_MAX)return -1;
+  for(unsigned slot=0;slot<s_slot_count;slot++) {
+    if(s_states[slot]!=1U || s_headers[slot].collection_id!=batch)continue;
+    ZigbeeBatchMetadata record;
+    if(QspiNor_Read(slot*ZB_VIB_SLOT_BYTES+ZB_VIB_METADATA_OFFSET,(uint8_t *)&record,sizeof(record))!=HAL_OK)return -1;
+    if(record.magic==UINT32_MAX)return 0;
+    if(record.magic!=ZB_VIB_METADATA_MAGIC || record.length!=length ||
+       record.crc!=v2_crc(record.payload,length))return -1;
+    memcpy(data,record.payload,length);return 1;
+  }
+  return 0;
+}
+
+int ZigbeeVibrationStore_SaveMetadata(uint32_t batch,const void *data,uint16_t length)
+{
+  if(!data || !length || length>ZIGBEE_BATCH_METADATA_MAX || s_capturing)return 0;
+  for(unsigned slot=0;slot<s_slot_count;slot++) {
+    if(s_states[slot]!=1U || s_headers[slot].collection_id!=batch)continue;
+    uint32_t address=slot*ZB_VIB_SLOT_BYTES+ZB_VIB_METADATA_OFFSET;
+    ZigbeeBatchMetadata record;
+    if(QspiNor_Read(address,(uint8_t *)&record,sizeof(record))!=HAL_OK)return 0;
+    if(record.magic==ZB_VIB_METADATA_MAGIC)
+      return record.length==length && record.crc==v2_crc(record.payload,length) &&
+             !memcmp(record.payload,data,length);
+    if(record.magic!=UINT32_MAX)return 0;
+    record.magic=ZB_VIB_METADATA_MAGIC;record.length=length;
+    memcpy(record.payload,data,length);record.crc=v2_crc(data,length);
+    /* Write into previously unused header-sector bytes. Commit magic last;
+     * existing waveform headers, policy and feature records stay unchanged. */
+    if(QspiNor_Write(address+4,(uint8_t *)&record+4,8U+length)!=HAL_OK ||
+       QspiNor_Write(address,(uint8_t *)&record.magic,4)!=HAL_OK)return 0;
+    return 1;
+  }
+  return 0;
 }
 
 int ZigbeeVibrationStore_SetRawPolicy(uint32_t batch, uint8_t upload)

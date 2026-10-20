@@ -19,6 +19,7 @@
 #include "zigbee_types.h"
 #include "vibration_tx.h"
 #include "sampling_cadence.h"
+#include "node_wake_plan.h"
 #include "vibration_features.h"
 #include "zigbee_vibration_store.h"
 
@@ -384,12 +385,14 @@ static ZbTxFrame_t ZbTxQueue[ZB_TX_QUEUE_DEPTH];
 static V2Tx ZbVibrationUpload;
 static volatile uint8_t ZbUploadQueueSleeping;
 static volatile uint8_t ZbUploadQueueWake;
+static uint32_t ZbUploadQueueDeadlineRtc;
+static uint8_t ZbSamplingCapture;
 static struct {
   VibFeatures stats;
   uint32_t batch, count, deadline, expected_crc;
   uint16_t rate;
   int32_t features[3][5];
-  uint8_t active, feature_only, raw_done, features_ready, queued, confirmed, tries;
+  uint8_t active, feature_only, raw_done, features_ready, queued, confirmed, tries, scalars_sent, upload_state_sent;
 } ZbDeferred;
 static ZbUploadRadioSlot_t ZbUploadSlots[3U];
 static struct nwk_fastpoll_entry_t *ZbUploadFastPoll;
@@ -445,7 +448,7 @@ void APP_ZIGBEE_Init(void)
   uint32_t random_batch_seed;
 
   ZbApp_Log("ZIGBEE: phase2 node initialization start\r\n");
-  ZbApp_Log("ZIGBEE: build ble-zigbee-single-upload-20261013 | %s %s\r\n", __DATE__, __TIME__);
+  ZbApp_Log("ZIGBEE: build ble-zigbee-upload-report-order-20261019 | %s %s\r\n", __DATE__, __TIME__);
   if (!ZbApp_CheckWirelessFirmware())
   {
     ZbApp_Log("ZIGBEE: compatible BLE/Zigbee RFD/FFD CPU2 firmware required\r\n");
@@ -501,6 +504,7 @@ void APP_ZIGBEE_Init(void)
   ZbApp.radio_control_deferred = 0U;
   memset(&ZbVibrationUpload, 0, sizeof(ZbVibrationUpload));
   ZbUploadQueueSleeping = 0U;
+  ZbUploadQueueWake=0U;ZbUploadQueueDeadlineRtc=0U;ZbSamplingCapture=0U;
   memset(ZbUploadSlots, 0, sizeof(ZbUploadSlots));
   ZbApp.restore_pending = 0U;
   ZbApp.commissioning_window_open = 1U;
@@ -822,6 +826,7 @@ static void ZbApp_RadioControlTask(void)
     memset(&ZbDeferred, 0, sizeof(ZbDeferred));
     ZbUploadQueueSleeping = 0U;
     ZbApp.upload_allowed = 0U; /* Committed Flash batches are retained. */
+    ZbSamplingCapture=0U;
     status = ZbStatePause(ZbApp.zb, ZbApp_RadioPausedCallback, NULL);
     if (status == ZB_STATUS_SUCCESS)
     {
@@ -1836,7 +1841,11 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
       UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_UPLOAD, CFG_SCH_PRIO_0);
       return ZCL_STATUS_SUCCESS;
     }
-    v2_tx_receive(&ZbVibrationUpload, payload, length, HAL_GetTick());
+    uint32_t waits_before=ZbVibrationUpload.wait_count;
+    uint32_t received_at=HAL_GetTick();
+    v2_tx_receive(&ZbVibrationUpload, payload, length, received_at);
+    if(ZbVibrationUpload.wait_count!=waits_before)
+      ZbUploadQueueDeadlineRtc=APP_ElapsedMs()+(ZbVibrationUpload.next_ms-received_at);
     UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_UPLOAD, CFG_SCH_PRIO_0);
     return ZCL_STATUS_SUCCESS;
   }
@@ -2099,6 +2108,7 @@ static void ZbApp_ReportTask(void)
   Custom_APP_ZigbeeSnapshot_t snapshot;
   uint8_t capture_without_network = ZbApp.offline_capture_requested;
   uint8_t raw_upload_due = 0U;
+  uint8_t sampling_wake = 0U;
 
   if (sampling_due != 0U)
   {
@@ -2107,13 +2117,23 @@ static void ZbApp_ReportTask(void)
     ZbApp_ArmSamplingTimer();
     if (!due) return;
     if (ZbApp.monitor_enabled==0U || ZbApp.audio_waiting ||
-        ZbApp.upload_allowed || v2_tx_active(&ZbVibrationUpload) ||
-        ZbApp.config_query_pending || ZbApp.restore_pending || ZbApp.radio_exclusive)
+        ZbApp.restore_pending || ZbApp.radio_exclusive)
     {
       ZbApp_Log("ZIGBEE: sampling deadline skipped busy=%u count=%u next_rtc=%lu ms\r\n",
                 ZbApp.monitor_state,due,(unsigned long)sampling_cadence.next);
       /* A coalesced report task may also be completing the current capture. */
       if (!ZbApp.audio_waiting) return;
+    }
+    else {
+      /* Sampling and queue wakeups are independent. Collection wins when both
+       * RTC deadlines expire; never turn an upload retry into a new sample. */
+      sampling_wake=1U;
+      if(ZbApp.config_query_pending) {
+        ZbApp.config_query_pending=0U;
+        ZbApp_StopConfigTransaction();
+        if(ZbApp.report_timer!=0xFFU)HW_TS_Stop(ZbApp.report_timer);
+      }
+      ZbApp_Log("ZIGBEE: wake reason=SAMPLING; cached parameters used, pending Flash batches retained\r\n");
     }
     if (due>1U)ZbApp_Log("ZIGBEE: sampling missed deadlines=%u; no catch-up burst\r\n",due-1U);
   }
@@ -2157,6 +2177,7 @@ static void ZbApp_ReportTask(void)
   }
 
   if ((ZbApp.audio_waiting == 0U) &&
+      !ZbSamplingCapture && !sampling_wake &&
       ((ZbApp.upload_allowed != 0U) || v2_tx_active(&ZbVibrationUpload)))
   {
     /* A duplicate enable/report event must not start a second capture while
@@ -2200,6 +2221,7 @@ static void ZbApp_ReportTask(void)
 
   if (ZbApp.audio_waiting == 0U)
   {
+    ZbSamplingCapture=1U;
     if (!sampling_cadence.active)
       sampling_cadence_start(&sampling_cadence,APP_ElapsedMs(),ZbApp.monitor_config.auto_interval_sec*1000U);
     ZbApp_ArmSamplingTimer();
@@ -2245,6 +2267,7 @@ static void ZbApp_ReportTask(void)
     return;
   }
   ZbApp.audio_waiting = 0U;
+  ZbSamplingCapture=0U;
   Custom_APP_ZigbeeFinishSnapshot(&snapshot);
   if ((snapshot.valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) != 0U)
   {
@@ -2262,6 +2285,11 @@ static void ZbApp_ReportTask(void)
     snapshot.valid_mask &= (uint8_t)~CUSTOM_APP_ZB_VALID_VIBRATION;
     ZbApp_Log("ZIGBEE: Flash upload policy save failed\r\n");
   }
+  _Static_assert(sizeof(snapshot)<=ZIGBEE_BATCH_METADATA_MAX,"snapshot metadata capacity");
+  if ((snapshot.valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) &&
+      !ZigbeeVibrationStore_SaveMetadata(ZbApp.batch_id,&snapshot,sizeof(snapshot)))
+    ZbApp_Log("ZIGBEE: batch=%lu scalar Flash metadata save failed; waveform retained\r\n",
+              (unsigned long)ZbApp.batch_id);
   if (capture_without_network != 0U)
   {
     ZbApp.pending_snapshot = snapshot;
@@ -2274,16 +2302,17 @@ static void ZbApp_ReportTask(void)
   }
   else
   {
-    ZbApp_SendSnapshot(&snapshot, ZbApp.batch_id);
     if ((snapshot.valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) != 0U)
     {
       ZbApp.monitor_state = ZB_MONITOR_UPLOADING;
-      (void)ZbApp_SendMonitorState(ZbApp.monitor_state);
+      /* Locally ready, but not yet permitted to send. Report UPLOADING only
+       * after BATCH/OK below; queued nodes must not announce an active upload. */
       ZbApp.upload_allowed = 1U;
       UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_UPLOAD, CFG_SCH_PRIO_0);
     }
     else
     {
+      ZbApp_SendSnapshot(&snapshot, ZbApp.batch_id);
       ZbApp_FinishCollectionCycle(
           ((ZbApp.monitor_config.sensor_enable_mask & CUSTOM_APP_ZB_SENSOR_VIBRATION) == 0U) ? 1U : 0U);
     }
@@ -2633,12 +2662,35 @@ static void ZbApp_UploadTask(void)
   static uint16_t logged_block;
   uint32_t now = HAL_GetTick();
 
+  unsigned wake_causes=node_wake_causes(APP_ElapsedMs(),
+      sampling_cadence.active && ZbApp.monitor_enabled,sampling_cadence.next,
+      ZbUploadQueueSleeping,ZbUploadQueueDeadlineRtc);
+  if(wake_causes & NODE_WAKE_SAMPLE) {
+    sampling_due=1U;
+    UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+  }
+  if (sampling_due || ZbSamplingCapture || ZbApp.audio_waiting) {
+    /* Acquisition owns the sensor/Flash pipeline for this short interval.
+     * The active batch and its receiver reservation are not discarded. */
+    ZbApp_StartTimer(ZbApp.upload_timer,100U);
+    return;
+  }
   if (ZbUploadQueueSleeping != 0U)
   {
     if (ZbUploadQueueWake == 0U) return;
+    if ((int32_t)(APP_ElapsedMs()-ZbUploadQueueDeadlineRtc)<0) {
+      ZbApp_StartTimer(ZbApp.upload_timer,ZbUploadQueueDeadlineRtc-APP_ElapsedMs());
+      return;
+    }
+    if (ZbApp.config_query_pending) {
+      ZbApp_StartTimer(ZbApp.upload_timer,100U);
+      return;
+    }
     ZbUploadQueueWake=0U;
     ZbUploadQueueSleeping=0U;
     v2_tx_resume(&ZbVibrationUpload,now);
+    ZbApp_Log("ZIGBEE: wake reason=UPLOAD_QUEUE; reapplying for batch=%lu, no acquisition\r\n",
+              (unsigned long)ZbDeferred.batch);
   }
   if (ZbApp.persist_tx_hold != 0U) return;
 
@@ -2674,6 +2726,7 @@ static void ZbApp_UploadTask(void)
   }
 
   if (ZbVibrationUpload.phase == V2_TX_ERROR) goto transfer_failed;
+  if (ZbVibrationUpload.deferred) goto queue_sleep;
   if (ZbVibrationUpload.phase == V2_TX_DONE)
   {
     ZbApp_Log("ZIGBEE: V2 batch=%lu waveform committed bytes=%lu packets=%lu; finalizing features\r\n",
@@ -2710,8 +2763,8 @@ static void ZbApp_UploadTask(void)
     ZbDeferred.feature_only=(policy==0);
     ZbDeferred.active=1U;
     vib_features_begin(&ZbDeferred.stats,ZbDeferred.batch,ZbDeferred.count);
-    if(!ZbDeferred.feature_only &&
-       !v2_tx_start(&ZbVibrationUpload,descriptor,now)) goto transfer_failed;
+    /* Features-only batches also request permission before bulk processing. */
+    if(!v2_tx_start(&ZbVibrationUpload,descriptor,now)) goto transfer_failed;
     ZbApp_StartUploadFastPoll();
     logged_block=0U;
     ZbApp_Log("ZIGBEE: Flash batch=%lu points=%lu mode=%s\r\n",
@@ -2719,7 +2772,27 @@ static void ZbApp_UploadTask(void)
               ZbDeferred.feature_only ? "features-only" : "raw-and-features");
   }
 
-  if (ZbDeferred.active && ZbDeferred.feature_only && !ZbDeferred.raw_done)
+  if (ZbDeferred.active && !ZbDeferred.upload_state_sent && ZbVibrationUpload.phase==V2_TX_PREPARE) {
+    if (ZbApp_SendMonitorStateForBatch(ZB_MONITOR_UPLOADING,ZbDeferred.batch)!=ZCL_STATUS_SUCCESS) {
+      ZbApp_StartTimer(ZbApp.upload_timer,V2_PACE_MS);
+      return;
+    }
+    ZbDeferred.upload_state_sent=1U;
+  }
+  if (ZbDeferred.active && !ZbDeferred.scalars_sent && ZbVibrationUpload.phase==V2_TX_PREPARE) {
+    Custom_APP_ZigbeeSnapshot_t saved;
+    int metadata=ZigbeeVibrationStore_LoadMetadata(ZbDeferred.batch,&saved,sizeof(saved));
+    if(metadata==1) {
+      saved.valid_mask &= (uint8_t)~CUSTOM_APP_ZB_VALID_VIBRATION;
+      ZbApp_SendSnapshot(&saved,ZbDeferred.batch);
+    } else if(metadata<0)
+      ZbApp_Log("ZIGBEE: batch=%lu scalar metadata read/CRC error\r\n",(unsigned long)ZbDeferred.batch);
+    ZbDeferred.scalars_sent=1U;
+  }
+  if (ZbDeferred.feature_only && ZbVibrationUpload.phase==V2_TX_PREPARE)
+    ZbVibrationUpload.phase=V2_TX_IDLE; /* BATCH/OK granted; no raw stream due. */
+  if (ZbDeferred.active && ZbDeferred.feature_only && !ZbDeferred.raw_done &&
+      ZbVibrationUpload.phase==V2_TX_IDLE)
   {
     uint32_t first=ZbDeferred.stats.sample_count;
     unsigned points=ZbDeferred.count-first;
@@ -2768,18 +2841,23 @@ static void ZbApp_UploadTask(void)
       ZbDeferred.deadline=now+(ZbDeferred.queued ? V2_SEND_STALL_MS : 1000U);
     }
   }
-  if (ZbVibrationUpload.deferred && !v2_due(now,ZbVibrationUpload.next_ms) &&
-      ZbApp.upload_timer != 0xFFU)
+queue_sleep:
+  if (ZbVibrationUpload.deferred && ZbApp.upload_timer != 0xFFU)
   {
     uint8_t busy = 0U;
     for (unsigned index=0U; index<3U; index++) busy |= ZbUploadSlots[index].busy;
     if (!busy)
     {
-      uint32_t delay = ZbVibrationUpload.next_ms-now;
+      uint32_t rtc_now=APP_ElapsedMs();
+      uint32_t delay=(int32_t)(ZbUploadQueueDeadlineRtc-rtc_now)>0 ?
+                     ZbUploadQueueDeadlineRtc-rtc_now : 1U;
       ZbUploadQueueSleeping = 1U;
       ZbUploadQueueWake = 0U;
       ZbApp_StopUploadFastPoll();
       ZbApp_StartTimer(ZbApp.upload_timer,delay);
+      ZbApp_Log("ZIGBEE: upload queued batch=%lu wait=%lu ms; query configuration then STOP2\r\n",
+                (unsigned long)ZbDeferred.batch,(unsigned long)delay);
+      if (!ZbApp.config_query_pending)ZbApp_RequestConfig(ZB_CONFIG_QUERY_COLLECTION);
       Custom_APP_ZigbeeActivityChanged();
       return;
     }
@@ -2808,6 +2886,7 @@ transfer_failed:
     ZbApp.monitor_state=ZbApp.monitor_enabled ? ZB_MONITOR_WAITING : ZB_MONITOR_SLEEP;
     Custom_APP_ZigbeeActivityChanged();
     if(ZbApp.monitor_enabled) ZbApp_RequestConfig(ZB_CONFIG_QUERY_COLLECTION);
+    else ZbApp_ScheduleMonitorStandby();
   }
 }
 
@@ -2889,6 +2968,7 @@ static void ZbApp_FinishCollectionCycle(uint8_t success)
   {
     ZbApp_RequestConfig(ZB_CONFIG_QUERY_COLLECTION);
   }
+  else ZbApp_ScheduleMonitorStandby();
 }
 
 static void ZbApp_CommandConfirm(struct ZbZclCommandRspT *response, void *arg)
@@ -3100,7 +3180,10 @@ static void ZbApp_SendPendingSnapshot(void)
     return;
   }
 
-  ZbApp_SendSnapshot(&ZbApp.pending_snapshot, ZbApp.pending_batch_id);
+  if(ZbApp.pending_snapshot.valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) {
+    ZbApp.upload_allowed=1U;
+    UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
+  } else ZbApp_SendSnapshot(&ZbApp.pending_snapshot, ZbApp.pending_batch_id);
   ZbApp_Log("ZIGBEE: pending snapshot batch=%lu queued after rejoin\r\n",
             (unsigned long)ZbApp.pending_batch_id);
   ZbApp.pending_snapshot_valid = 0U;
@@ -3128,6 +3211,11 @@ static enum ZclStatusCodeT ZbApp_SendMonitorStateForBatch(uint8_t state,
 static void ZbApp_ScheduleMonitorStandby(void)
 {
   if (!network_authorized || ZbApp.monitor_enabled || ZbApp.config_query_pending) return;
+  if(ZbUploadQueueSleeping) {
+    UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY,UTIL_LPM_ENABLE);
+    Custom_APP_ZigbeeActivityChanged();
+    return; /* Queue RTC timer, not standby polling, owns the next upload wake. */
+  }
   uint32_t now = APP_ElapsedMs(); /* RTC-backed, advances through STOP2. */
   if (!monitor_standby.seen) {
     ZbApp_Log("ZIGBEE: monitoring off; first authorized standby is 10 minutes\r\n");
