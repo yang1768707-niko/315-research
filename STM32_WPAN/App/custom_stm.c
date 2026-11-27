@@ -69,10 +69,10 @@ extern uint16_t Connection_Handle;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-uint16_t SizeSensor_Status = 32;
-uint16_t SizeSensor_Ctrl = 4;
+uint16_t SizeSensor_Status = 80;
+uint16_t SizeSensor_Ctrl = 20;
 uint16_t SizeVib_Wave = 244;
-uint16_t SizeVib_Ctrl = 4;
+uint16_t SizeVib_Ctrl = 20;
 
 /**
  * START of Section BLE_DRIVER_CONTEXT

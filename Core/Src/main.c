@@ -23,7 +23,10 @@
 /* USER CODE BEGIN Includes */
 #include "custom_app.h"
 #include "app_entry.h"
+#include "download_reset.h"
+#include "zigbee_vibration_store.h"
 #include <stdio.h>
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -70,7 +73,10 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
-
+/* Downloaded anew even when the application binary did not change. Runtime
+   never programs over this double word: erase its dedicated page first (ECC). */
+static const uint64_t DownloadResetImage
+    __attribute__((section(".download_reset"), used, aligned(8))) = DOWNLOAD_RESET_ARMED;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,7 +101,69 @@ static void MX_RF_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void DownloadReset_Log(const char *message)
+{
+  (void)HAL_UART_Transmit(&huart1, (uint8_t *)message,
+                         (uint16_t)strlen(message), 1000U);
+}
 
+static uint64_t DownloadReset_Marker(void *context)
+{
+  UNUSED(context);
+  return *(volatile const uint64_t *)(uintptr_t)DOWNLOAD_RESET_ADDRESS;
+}
+
+static int DownloadReset_DiscardRecords(void *context)
+{
+  UNUSED(context);
+  /* This runs BEFORE MX_APPE_Init starts CPU2. Never bypass the existing
+     dual-core Flash arbitration if a debug session left CPU2 running. */
+  if ((PWR->CR4 & PWR_CR4_C2BOOT) != 0U) {
+    DownloadReset_Log("FLASH-CLEAR: CPU2 already running; use hardware reset/Connect under reset\r\n");
+    return 0;
+  }
+  DownloadReset_Log("FLASH-CLEAR: download detected; invalidating old collection records (no external erase)\r\n");
+  return ZigbeeVibrationStore_ResetRecords() == HAL_OK;
+}
+
+static int DownloadReset_Commit(void *context)
+{
+  UNUSED(context);
+  _Static_assert(FLASH_PAGE_SIZE == DOWNLOAD_RESET_PAGE_BYTES, "download marker page geometry");
+  if ((PWR->CR4 & PWR_CR4_C2BOOT) != 0U ||
+      (uintptr_t)&DownloadResetImage != DOWNLOAD_RESET_ADDRESS) return 0;
+  if (HAL_FLASH_Unlock() != HAL_OK) return 0;
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPTVERR);
+  FLASH_EraseInitTypeDef erase = {0};
+  erase.TypeErase = FLASH_TYPEERASE_PAGES;
+  erase.Page = (DOWNLOAD_RESET_ADDRESS - FLASH_BASE) / FLASH_PAGE_SIZE;
+  erase.NbPages = 1U;
+  uint32_t error_page = UINT32_MAX;
+  HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase, &error_page);
+  if (status == HAL_OK && error_page == UINT32_MAX)
+    status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                               DOWNLOAD_RESET_ADDRESS, DOWNLOAD_RESET_DONE);
+  else status = HAL_ERROR;
+  if (HAL_FLASH_Lock() != HAL_OK) status = HAL_ERROR;
+  if (READ_BIT(FLASH->ACR, FLASH_ACR_DCEN) != 0U) {
+    __HAL_FLASH_DATA_CACHE_DISABLE();
+    __HAL_FLASH_DATA_CACHE_RESET();
+    __HAL_FLASH_DATA_CACHE_ENABLE();
+  }
+  return status == HAL_OK;
+}
+
+static void DownloadReset_Boot(void)
+{
+  const DownloadResetIO io = {NULL, DownloadReset_Marker, DownloadReset_DiscardRecords, DownloadReset_Commit};
+  int result = download_reset_run(&io);
+  if (result < 0) {
+    DownloadReset_Log("FLASH-CLEAR: FAILED; sampling/radio NOT started; reset to retry cleanup\r\n");
+    Error_Handler();
+  }
+  DownloadReset_Log(result ? "FLASH-CLEAR: complete; old records invalidated; payload retained; marker committed\r\n" :
+                            "FLASH-CLEAR: already completed for this download; cached data retained\r\n");
+}
 /* USER CODE END 0 */
 
 /**
@@ -161,6 +229,7 @@ int main(void)
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_test,
                       (uint16_t)uart_test_len, 100U);
   }
+  DownloadReset_Boot();
   /* USER CODE END 2 */
 
   /* Init code for STM32_WPAN */

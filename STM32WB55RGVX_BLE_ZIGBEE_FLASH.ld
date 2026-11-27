@@ -45,7 +45,8 @@ _Min_Stack_Size = 0x1000; /* required amount of stack */
 MEMORY
 {
   /* CPU1 application must not overlap Zigbee NVM at 0x08070000-0x0807FFFF. */
-  FLASH (rx)                 : ORIGIN = 0x08000000, LENGTH = 448K
+  FLASH (rx)                 : ORIGIN = 0x08000000, LENGTH = 444K
+  DOWNLOAD_RESET (r)         : ORIGIN = 0x0806F000, LENGTH = 4K
   ZIGBEE_NVM (r)             : ORIGIN = 0x08070000, LENGTH = 64K
   RAM (xrw)                 : ORIGIN = 0x20000008, LENGTH = 0x2FFF8
 RAM_SHARED (xrw)           : ORIGIN = 0x20030000, LENGTH = 10K
@@ -57,6 +58,15 @@ PROVIDE(__zigbee_nvm_end__ = ORIGIN(ZIGBEE_NVM) + LENGTH(ZIGBEE_NVM));
 /* Define output sections */
 SECTIONS
 {
+  /* Included in ELF/HEX downloads, not NOLOAD. Re-downloading the same image
+     restores ARMED. Runtime erases only this page to commit DONE. */
+  .download_reset :
+  {
+    KEEP(*(.download_reset))
+  } >DOWNLOAD_RESET
+  ASSERT(ADDR(.download_reset) == 0x0806F000, "download marker address")
+  ASSERT(SIZEOF(.download_reset) == 8, "download marker must be one double word")
+
   /* The startup code goes first into FLASH */
   .isr_vector :
   {

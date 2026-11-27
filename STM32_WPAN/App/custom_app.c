@@ -13,6 +13,7 @@
 #include "dbg_trace.h"
 #include "ble.h"
 #include "custom_app.h"
+#include "scalar_delivery.h"
 #include "qspi_nor.h"
 #include "zigbee_vibration_store.h"
 #include "custom_stm.h"
@@ -35,6 +36,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include "comm_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -115,6 +117,7 @@ typedef struct
 
 #define DT_ZB_STORE_RING_POINTS         13334U
 #define DT_ZB_STORE_WRITE_POINTS        160U
+#define DT_ZB_STORE_REFILL_POINTS       ((QSPI_NOR_PAGE_SIZE + DT_VIB_SAMPLE_PAYLOAD_SIZE - 1U) / DT_VIB_SAMPLE_PAYLOAD_SIZE)
 #define DT_ZB_STORE_ACTIVE_FIFO_MAX     64U
 #define DT_ZB_CAPTURE_WATCHDOG_SLACK_MS 1500U
 
@@ -176,6 +179,17 @@ typedef struct
 #define DT_AUDIO_RESTART_PERIOD_MS       1000U
 #define DT_AUDIO_HEALTH_PERIOD_MS        2000U
 #define DT_PERIODIC_STREAM_LOGS          0U
+#define DT_CMD_WORK_MODE_QUERY          0xF0U
+#define DT_CMD_WORK_MODE_SET            0xF1U
+#define DT_WORK_MODE_RESULT_OK          COMM_OK
+#define DT_WORK_MODE_RESULT_BAD_VALUE   COMM_BAD_VALUE
+#define DT_WORK_MODE_RESULT_SAVE_FAILED COMM_SAVE_FAILED
+#define DT_WORK_MODE_BACKUP_REGISTER    RTC_BKP_DR19
+#define DT_WORK_MODE_BACKUP_MAGIC       0x57423500UL
+#define DT_WORK_MODE_BACKUP_MASK        0xFFFFFF00UL
+#define DT_WORK_MODE_REPLY_RETRY_MS     20U
+#define DT_WORK_MODE_REPLY_ATTEMPTS     20U
+#define DT_WORK_MODE_RESTART_DELAY_MS   1500U
 /* USER CODE END PD */
 
 /* Private macros -------------------------------------------------------------*/
@@ -201,6 +215,26 @@ static uint8_t VibTxBuffer[DT_VIB_PACKET_SIZE];
 static uint8_t SensorTxBuffer[DT_SENSOR_PACKET_SIZE];
 static uint8_t VibFifoRawBuffer[VIBROMETER_FIFO_DMA_MAX_BYTES];
 static uint8_t SensorTimerId;
+/* Unified stream owner is a routing choice, not a different sensor driver. */
+static CommLink CommStreamLink = COMM_LINK_BLE;
+static uint8_t CommStreamMode, CommBatchPending, CommDraining, CommDrainStatus;
+static uint32_t CommBleSession, CommBatchId, CommRawIndex;
+static uint8_t CommMtuPending;
+static uint32_t CommMtuRetry;
+static uint16_t CommBleCapacity = 20U, CommFactor = COMM_DEFAULT_DECIMATION;
+static uint16_t CommActiveFactor = COMM_DEFAULT_DECIMATION, CommPhase;
+static uint32_t CommWindows[5], CommDeadlines[5];
+static uint16_t CommTimedMask, CommStatusMask;
+static uint16_t CommStatusByCode[5];
+static CommScalars CommFinalScalars;
+static uint8_t CommFinalPending, CommStoredCapture;
+static uint16_t CommStoredMask, CommStoredRequested;
+static uint16_t ZigbeeCaptureMask=COMM_SENSOR_ALL;
+static uint16_t CommFrameLength;
+static uint8_t CommFrame[COMM_FRAME_MAX];
+static uint8_t CommFrameCode;
+static uint32_t CommRetryAt;
+static int16_t CommSamples[40][3];
 static volatile uint8_t VibFifoIrqPending;
 static uint8_t ZigbeeAudioWindowActive;
 static uint32_t ZigbeeAudioWindowDeadline;
@@ -216,12 +250,26 @@ static uint16_t ZigbeeAnalogMicWindowMs;
 static uint8_t ZigbeeSensorEnableMask = CUSTOM_APP_ZB_SENSOR_ALL;
 static uint32_t ZigbeeSnapshotBatchId;
 static uint8_t ZigbeeVibrationStoreActive;
-static int16_t ZigbeeStoreSamples[160U][3];
 static DT_ZigbeeVibrationAccumulator_t ZigbeeVibration;
 static int16_t ZigbeeStoreRing[DT_ZB_STORE_RING_POINTS][3];
 static uint16_t ZigbeeStoreHead, ZigbeeStoreTail, ZigbeeStoreCount;
 static uint16_t ZigbeeFifoReadPending;
 static uint8_t ZigbeeVibrationServicing;
+static uint32_t ZigbeeCaptureWriteMs, ZigbeeCaptureCommittedBytes;
+
+/* The selected BLE policy is applied after reset, not in an active link.
+   RTC BKP19 is unused by this project; no Zigbee NVM/Flash page is touched. */
+static uint8_t DT_ActiveWorkMode;
+static uint8_t DT_ConfiguredWorkMode;
+static uint8_t DT_WorkModeResult;
+static uint8_t DT_WorkModeSendPending, DT_WorkModeReadPending;
+static uint8_t DT_WorkModeSendAttempts, DT_WorkModeReadAttempts;
+static uint32_t DT_WorkModeReplyTick;
+static uint8_t DT_ModeRestartOnNotify;
+static uint8_t DT_WorkModeTimerId, DT_WorkModeTimerReady;
+static uint8_t DT_ModeRestartPending, DT_ModeRestartScheduled;
+static uint32_t DT_ModeRestartTick;
+extern RTC_HandleTypeDef hrtc;
 
 extern SPI_HandleTypeDef hspi1;
 extern UART_HandleTypeDef huart1;
@@ -241,6 +289,23 @@ static void Custom_Vib_wave_Send_Notification(void);
 
 /* USER CODE BEGIN PFP */
 static void DT_SendTask(void);
+static void DT_LoadWorkMode(void);
+static void DT_SaveWorkMode(uint8_t mode);
+static void DT_QueueWorkModeStatus(void);
+static void DT_ProcessWorkMode(uint32_t now);
+static void DT_ScheduleWorkMode(void);
+static void DT_ServiceWorkModeTask(void);
+static void DT_ConfirmModeRestart(uint8_t configured);
+static CommResult DT_CommWorkMode(const CommRequest *request, uint8_t *active, uint8_t *configured);
+static uint16_t DT_CommActiveMask(void);
+static CommResult DT_CommExecute(const CommRequest *request, uint16_t *active);
+static CommResult DT_CommBleSend(const CommSource *source, const uint8_t *frame, uint16_t length);
+static void DT_CommSendTask(void);
+static void DT_CommPoll(uint32_t now);
+static uint8_t DT_CommReady(uint8_t vibration);
+static void DT_CommStop(uint16_t mask);
+static void DT_CommCollectScalars(CommScalars *values);
+static void DT_CommQueueStatus(uint8_t status, uint16_t mask);
 static void DT_VibDrainTask(void);
 static void DT_StartSensorStream(void);
 static void DT_StopSensorStream(void);
@@ -285,12 +350,14 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
       /* USER CODE BEGIN CUSTOM_STM_SENSOR_STATUS_NOTIFY_ENABLED_EVT */
       Custom_App_Context.Sensor_status_Notification_Status = 1U;
       DT_StartSensorStream();
+      DT_QueueWorkModeStatus();
       /* USER CODE END CUSTOM_STM_SENSOR_STATUS_NOTIFY_ENABLED_EVT */
       break;
 
     case CUSTOM_STM_SENSOR_STATUS_NOTIFY_DISABLED_EVT:
       /* USER CODE BEGIN CUSTOM_STM_SENSOR_STATUS_NOTIFY_DISABLED_EVT */
       Custom_App_Context.Sensor_status_Notification_Status = 0U;
+      DT_WorkModeSendPending = 0U;
       Custom_App_Context.SensorEnableMask = 0U;
       DT_StopSensorStream();
       /* USER CODE END CUSTOM_STM_SENSOR_STATUS_NOTIFY_DISABLED_EVT */
@@ -298,12 +365,22 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
 
     case CUSTOM_STM_SENSOR_CTRL_READ_EVT:
       /* USER CODE BEGIN CUSTOM_STM_SENSOR_CTRL_READ_EVT */
+      DT_WorkModeReadPending = 1U;
+      DT_ScheduleWorkMode();
       /* USER CODE END CUSTOM_STM_SENSOR_CTRL_READ_EVT */
       break;
 
     case CUSTOM_STM_SENSOR_CTRL_WRITE_NO_RESP_EVT:
       /* USER CODE BEGIN CUSTOM_STM_SENSOR_CTRL_WRITE_NO_RESP_EVT */
-      DT_HandleSensorCtrl(pNotification->DataTransfered.pPayload, pNotification->DataTransfered.Length);
+      if (pNotification->DataTransfered.Length >= COMM_HEADER_SIZE) {
+        CommSource source={COMM_LINK_BLE,CommBleSession};
+        (void)Comm_Receive(&source,pNotification->DataTransfered.pPayload,pNotification->DataTransfered.Length);
+      } else DT_HandleSensorCtrl(pNotification->DataTransfered.pPayload, pNotification->DataTransfered.Length);
+      /* GATT writes replace FE82's stored bytes. The send task restores its
+         readable status after this HCI event returns. */
+      DT_WorkModeReadPending = 1U;
+      DT_WorkModeReadAttempts = 0U;
+      DT_ScheduleWorkMode();
       /* USER CODE END CUSTOM_STM_SENSOR_CTRL_WRITE_NO_RESP_EVT */
       break;
 
@@ -329,7 +406,11 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
 
     case CUSTOM_STM_VIB_CTRL_WRITE_NO_RESP_EVT:
       /* USER CODE BEGIN CUSTOM_STM_VIB_CTRL_WRITE_NO_RESP_EVT */
-      DT_HandleVibCtrl(pNotification->DataTransfered.pPayload, pNotification->DataTransfered.Length);
+      if (pNotification->DataTransfered.Length >= COMM_HEADER_SIZE) {
+        CommSource source={COMM_LINK_BLE,CommBleSession};
+        (void)Comm_Receive(&source,pNotification->DataTransfered.pPayload,pNotification->DataTransfered.Length);
+        DT_ScheduleWorkMode();
+      } else DT_HandleVibCtrl(pNotification->DataTransfered.pPayload, pNotification->DataTransfered.Length);
       /* USER CODE END CUSTOM_STM_VIB_CTRL_WRITE_NO_RESP_EVT */
       break;
 
@@ -362,7 +443,22 @@ void Custom_APP_Notification(Custom_App_ConnHandle_Not_evt_t *pNotification)
     case CUSTOM_CONN_HANDLE_EVT :
       /* USER CODE BEGIN CUSTOM_CONN_HANDLE_EVT */
       Custom_App_Context.ConnectionHandle = pNotification->ConnectionHandle;
+      if (CommStreamMode) {
+        CommStoredCapture=0;
+        DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();DT_StopSensorStream();
+      }
+      CommStreamMode=0;CommStreamLink=COMM_LINK_BLE;CommBleCapacity=20U;
+      CommTimedMask=0;CommFrameLength=0;CommStatusMask=0;CommBatchPending=0;
+      memset(CommStatusByCode,0,sizeof(CommStatusByCode));CommFinalPending=0;CommDraining=0;
+      Comm_SetSession(COMM_LINK_BLE,++CommBleSession);
+      CommMtuPending=1U;CommMtuRetry=HAL_GetTick();
       Custom_App_Context.IsConnected = 1U;
+      DT_ModeRestartOnNotify = 0U;
+      DT_WorkModeSendPending = 0U;
+      DT_WorkModeReadPending = 1U;
+      DT_WorkModeReadAttempts = 0U;
+      DT_WorkModeReplyTick = 0U;
+      DT_ScheduleWorkMode();
       /* A new phone connection starts with no sensor selected. Do not reuse
          the enable mask from a previous connection or an interrupted command. */
       Custom_App_Context.SensorEnableMask = 0U;
@@ -374,7 +470,16 @@ void Custom_APP_Notification(Custom_App_ConnHandle_Not_evt_t *pNotification)
 
     case CUSTOM_DISCON_HANDLE_EVT :
       /* USER CODE BEGIN CUSTOM_DISCON_HANDLE_EVT */
+      Comm_SetSession(COMM_LINK_BLE,++CommBleSession);
+      if (CommStreamLink==COMM_LINK_BLE) {
+        CommTimedMask=0;CommFrameLength=0;CommStatusMask=0;CommBatchPending=0;
+      memset(CommStatusByCode,0,sizeof(CommStatusByCode));CommFinalPending=0;CommDraining=0;
+        CommStreamMode=0;
+      }
       Custom_App_Context.IsConnected = 0U;
+      DT_WorkModeSendPending = DT_WorkModeReadPending = 0U;
+      if (DT_WorkModeTimerReady != 0U && DT_ModeRestartScheduled == 0U)
+        HW_TS_Stop(DT_WorkModeTimerId);
       Custom_App_Context.ConnectionHandle = 0xFFFFU;
       Custom_App_Context.Sensor_status_Notification_Status = 0U;
       Custom_App_Context.Vib_wave_Notification_Status = 0U;
@@ -411,6 +516,10 @@ void Custom_APP_Init(void)
   char sensor_log[96];
   char temperature_log[64];
 
+  DT_LoadWorkMode();
+  Comm_Init(DT_CommExecute);
+  Comm_RegisterWorkModeHandler(DT_CommWorkMode);
+  Comm_RegisterTransport(COMM_LINK_BLE,DT_CommBleSend);
   BSP_LED_Init(LED_MEAS);
   BSP_LED_Init(LED_BLUE);
   BSP_LED_Init(LED_RED);
@@ -473,6 +582,9 @@ void Custom_APP_Init(void)
   Custom_App_Context.SensorEnableMask = 0U;
   Custom_App_Context.TxFlowOn = 1U;
   (void)HW_TS_Create(CFG_TIM_PROC_ID_ISR, &SensorTimerId, hw_ts_Repeated, DT_SensorTimerCallback);
+  DT_WorkModeTimerReady =
+      HW_TS_Create(CFG_TIM_PROC_ID_ISR, &DT_WorkModeTimerId, hw_ts_SingleShot,
+                   DT_ScheduleWorkMode) == hw_ts_Successful;
   UTIL_SEQ_RegTask(1U << CFG_TASK_DT_SEND_ID, UTIL_SEQ_RFU, DT_SendTask);
   UTIL_SEQ_RegTask(1U << CFG_TASK_DT_VIB_DRAIN_ID, UTIL_SEQ_RFU,
                    DT_VibDrainTask);
@@ -506,6 +618,19 @@ void Custom_APP_Process(void)
   uint32_t now;
 
   now = HAL_GetTick();
+  if (DT_WorkModeTimerReady == 0U)
+    DT_ProcessWorkMode(now);
+  if(CommMtuPending && Custom_App_Context.IsConnected && (int32_t)(now-CommMtuRetry)>=0) {
+    /* Request MTU ourselves so ACI_ATT_EXCHANGE_MTU_RESP always provides the
+     * peer's receive limit, including phones that initiate their own exchange. */
+    tBleStatus mtu_status=aci_gatt_exchange_config(Custom_App_Context.ConnectionHandle);
+    if(mtu_status==BLE_STATUS_SUCCESS)CommMtuPending=0U;
+    else CommMtuRetry=now+1000U;
+  }
+  if (Comm_HasPending())
+    DT_ScheduleWorkMode();
+  DT_CommPoll(now);
+  APP_ZIGBEE_GatewayProcess();
 
   /* Reassert active-low LED outputs after every wake and keep them tied to
      the authoritative BLE/Zigbee connection and acquisition state. */
@@ -608,6 +733,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
+void QspiNor_ProgramEvent(void)
+{
+  if (ZigbeeVibrationWindowActive != 0U)
+    UTIL_SEQ_SetTask(1U << CFG_TASK_DT_VIB_DRAIN_ID, CFG_SCH_PRIO_0);
+}
+
 void Custom_APP_PrepareStop2(void)
 {
   /* STOP2 is only selected when DT_UpdateLowPowerLock() confirms that no
@@ -668,9 +799,10 @@ uint8_t Custom_APP_ZigbeeBeginSnapshot(uint16_t vibration_rate_hz,
     return 0U;
   }
 
-  /* Keep the low-speed sensors awake for the complete snapshot window. */
-  (void)Magnetometer_ExitLowPower();
-  (void)Thermometer_ExitLowPower();
+  /* Common finite commands can select temperature/magnetic independently. */
+  ZigbeeCaptureMask=CommStoredCapture?CommStoredRequested:Comm_MaskFromZigbee(sensor_enable_mask);
+  if(ZigbeeCaptureMask & COMM_SENSOR_MAGNETIC)(void)Magnetometer_ExitLowPower();
+  if(ZigbeeCaptureMask & COMM_SENSOR_TEMPERATURE)(void)Thermometer_ExitLowPower();
 
   ZigbeeDigitalMicStarted = 0U;
   ZigbeeAnalogMicStarted = 0U;
@@ -755,9 +887,19 @@ static HAL_StatusTypeDef DT_StartZigbeeVibration(uint16_t window_ms)
     /* Erasing the QSPI slot can take tens of milliseconds. Complete it before
        enabling the sensor FIFO; doing it in the opposite order overflows the
        512-word FIFO before its first service. */
-    if (ZigbeeVibrationStore_Begin(DT_ZIGBEE_VIBRATION_RATE_HZ,
-                                   window_ms,
-                                   ZigbeeSnapshotBatchId) != HAL_OK)
+    status = ZigbeeVibrationStore_Begin(DT_ZIGBEE_VIBRATION_RATE_HZ,
+                                         window_ms, ZigbeeSnapshotBatchId);
+    ZigbeeVibrationOverwrite_t overwritten;
+    if (ZigbeeVibrationStore_TakeOverwrite(&overwritten))
+    {
+      char overwrite_log[160];
+      (void)snprintf(overwrite_log, sizeof(overwrite_log),
+                     "VIB-FLASH: cache full; discarded oldest pending batch=%lu for new batch=%lu slot=%u; active upload protected\r\n",
+                     (unsigned long)overwritten.discarded_batch,
+                     (unsigned long)overwritten.replacement_batch, overwritten.slot);
+      DT_Log(overwrite_log);
+    }
+    if (status != HAL_OK)
     {
       if (ZigbeeVibrationStore_IsReady() == 0U)
       {
@@ -765,13 +907,25 @@ static HAL_StatusTypeDef DT_StartZigbeeVibration(uint16_t window_ms)
       }
       else
       {
-        DT_Log("VIB-FLASH: no writable slot for Zigbee capture\r\n");
+        DT_Log(status == HAL_BUSY ?
+            "VIB-FLASH: no reclaimable slot (upload protected or quarantined)\r\n" :
+            "VIB-FLASH: slot preparation failed; check Flash erase/write/read\r\n");
       }
       return HAL_ERROR;
     }
     ZigbeeVibrationStoreActive = 1U;
     ZigbeeStoreHead = ZigbeeStoreTail = ZigbeeStoreCount = 0U;
     ZigbeeFifoReadPending = 0U;
+    ZigbeeCaptureWriteMs = ZigbeeCaptureCommittedBytes = 0U;
+    {
+      char log_line[112];
+      (void)snprintf(log_line, sizeof(log_line),
+                     "VIB: prepare capture window=%u ms target=%lu ring=%u points\r\n",
+                     (unsigned int)window_ms,
+                     (unsigned long)target_samples,
+                     (unsigned int)DT_ZB_STORE_RING_POINTS);
+      DT_Log(log_line);
+    }
     status = Vibrometer_StartContinuousFifo();
     if (status != HAL_OK)
     {
@@ -788,15 +942,6 @@ static HAL_StatusTypeDef DT_StartZigbeeVibration(uint16_t window_ms)
                                      DT_ZB_CAPTURE_WATCHDOG_SLACK_MS;
     ZigbeeVibrationLastServiceTick = HAL_GetTick();
     ZigbeeVibrationWindowActive = 1U;
-    {
-      char log_line[112];
-      (void)snprintf(log_line, sizeof(log_line),
-                     "VIB: streaming capture window=%u ms target=%lu ring=%u points\r\n",
-                     (unsigned int)window_ms,
-                     (unsigned long)target_samples,
-                     (unsigned int)DT_ZB_STORE_RING_POINTS);
-      DT_Log(log_line);
-    }
     DT_UpdateLowPowerLock();
   }
   return status;
@@ -819,16 +964,18 @@ void Custom_APP_ZigbeeFinishSnapshot(Custom_APP_ZigbeeSnapshot_t *snapshot)
   }
 
   (void)memset(snapshot, 0, sizeof(*snapshot));
+  snapshot->scalar_required_mask=CommStoredCapture ? (uint8_t)(CommStoredRequested & COMM_SENSOR_SCALARS) : scalar_expected_mask(ZigbeeSensorEnableMask);
+  snapshot->scalar_policy_version=SCALAR_POLICY_VERSION;
   DigitalMicrophone_Process();
   AnalogMicrophone_Process();
 
-  if (Thermometer_AppendPayload(payload, sizeof(payload)) == 2U)
+  if ((ZigbeeCaptureMask & COMM_SENSOR_TEMPERATURE) && Thermometer_AppendPayload(payload, sizeof(payload)) == 2U)
   {
     snapshot->temperature_centi_c = (int16_t)((uint16_t)payload[0] |
                                                ((uint16_t)payload[1] << 8U));
     snapshot->valid_mask |= CUSTOM_APP_ZB_VALID_TEMPERATURE;
   }
-  if (Magnetometer_AppendPayload(payload, sizeof(payload)) == 6U)
+  if ((ZigbeeCaptureMask & COMM_SENSOR_MAGNETIC) && Magnetometer_AppendPayload(payload, sizeof(payload)) == 6U)
   {
     snapshot->magnetic_0p1_ut[0] = (int16_t)((uint16_t)payload[0] |
                                              ((uint16_t)payload[1] << 8U));
@@ -930,6 +1077,15 @@ void Custom_APP_ZigbeeActivityChanged(void)
   DT_UpdateStatusLeds();
   DT_UpdateLowPowerLock();
 }
+Custom_APP_WorkMode_t Custom_APP_GetWorkMode(void)
+{
+  return (Custom_APP_WorkMode_t)DT_ActiveWorkMode;
+}
+
+Custom_APP_WorkMode_t Custom_APP_GetConfiguredWorkMode(void)
+{
+  return (Custom_APP_WorkMode_t)DT_ConfiguredWorkMode;
+}
 /* USER CODE END FD */
 
 /*************************************************************
@@ -1013,8 +1169,7 @@ __USED void Custom_Vib_wave_Send_Notification(void) /* Property Notification */
 /* USER CODE BEGIN FD_LOCAL_FUNCTIONS*/
 static void DT_StartSensorStream(void)
 {
-  if ((Custom_App_Context.IsConnected == 0U) ||
-      (Custom_App_Context.Sensor_status_Notification_Status == 0U))
+  if (DT_CommReady(0U) == 0U)
   {
     return;
   }
@@ -1041,8 +1196,7 @@ static void DT_ApplySensorEnableMask(uint8_t requested_mask)
   uint8_t active_mask = (uint8_t)(requested_mask & DT_SENSOR_ENABLE_ALL);
   char sensor_log[80];
 
-  if ((Custom_App_Context.IsConnected == 0U) ||
-      (Custom_App_Context.Sensor_status_Notification_Status == 0U))
+  if (DT_CommReady(0U) == 0U)
   {
     AnalogMicrophone_Stop();
     DigitalMicrophone_Stop();
@@ -1156,8 +1310,7 @@ static void DT_StartVibStream(void)
 {
   HAL_StatusTypeDef status;
 
-  if ((Custom_App_Context.IsConnected == 0U) ||
-      (Custom_App_Context.Vib_wave_Notification_Status == 0U))
+  if (DT_CommReady(1U) == 0U)
   {
     return;
   }
@@ -1202,7 +1355,7 @@ static void DT_StartVibStream(void)
   Custom_App_Context.VibDecimationPhase = 0U;
   VibFifoIrqPending = 0U;
   DT_UpdateStatusLeds();
-  DT_Log("VIB: stream armed, BLE preview 6667 Hz (4:1)\r\n");
+  DT_Log("VIB: stream armed\r\n");
   UTIL_SEQ_SetTask(1U << CFG_TASK_DT_SEND_ID, CFG_SCH_PRIO_1);
 }
 
@@ -1231,7 +1384,7 @@ static void DT_UpdateStatusLeds(void)
   uint8_t measuring =
       ((Custom_App_Context.SensorStreaming != 0U) ||
        (Custom_App_Context.VibStreaming != 0U) ||
-       (APP_ZIGBEE_IsMeasuring() != 0U)) ? 1U : 0U;
+       (APP_ZIGBEE_IsMeasuring() != 0U) || CommStoredCapture) ? 1U : 0U;
 
   if (network_connected != 0U)
   {
@@ -1268,8 +1421,7 @@ static void DT_ToggleVibStream(void)
 
 static void DT_SensorTimerCallback(void)
 {
-  if ((Custom_App_Context.SensorStreaming != 0U) &&
-      (Custom_App_Context.Sensor_status_Notification_Status != 0U))
+  if ((Custom_App_Context.SensorStreaming != 0U) && DT_CommReady(0U))
   {
     Custom_App_Context.SensorSendPending = 1U;
     UTIL_SEQ_SetTask(1U << CFG_TASK_DT_SEND_ID, CFG_SCH_PRIO_1);
@@ -1279,6 +1431,8 @@ static void DT_SensorTimerCallback(void)
 static void DT_UpdateLowPowerLock(void)
 {
   if ((Custom_App_Context.IsConnected != 0U) ||
+      (Comm_HasPending() != 0U) ||
+      (APP_ZIGBEE_WaitingGateway() != 0U) ||
       (APP_ZIGBEE_IsPendingAuthorization() != 0U) ||
       (Custom_App_Context.VibStreaming != 0U) ||
       (ZigbeeAudioWindowActive != 0U) ||
@@ -1399,6 +1553,167 @@ static void DT_LogAudioHealth(uint32_t now)
 }
 #endif
 
+static void DT_LoadWorkMode(void)
+{
+  uint32_t stored = HAL_RTCEx_BKUPRead(&hrtc, DT_WORK_MODE_BACKUP_REGISTER);
+  uint8_t mode = (uint8_t)stored;
+  char line[80];
+  if (((stored & DT_WORK_MODE_BACKUP_MASK) != DT_WORK_MODE_BACKUP_MAGIC) ||
+      (mode > CUSTOM_APP_WORK_MODE_INSPECTION))
+  {
+    mode = CUSTOM_APP_WORK_MODE_ONLINE;
+  }
+  DT_ActiveWorkMode = DT_ConfiguredWorkMode = mode;
+  DT_ModeRestartPending = DT_ModeRestartScheduled = 0U;
+  DT_WorkModeResult = DT_WORK_MODE_RESULT_OK;
+  DT_ModeRestartOnNotify = 0U;
+  DT_WorkModeSendPending = DT_WorkModeReadPending = 0U;
+  DT_WorkModeSendAttempts = DT_WorkModeReadAttempts = 0U;
+  DT_WorkModeReplyTick = 0U;
+  (void)snprintf(line, sizeof(line), "MODE: boot active=%u saved=%u (BLE policy)\r\n",
+                 (unsigned int)mode, (unsigned int)mode);
+  DT_Log(line);
+}
+
+static void DT_SaveWorkMode(uint8_t mode)
+{
+  uint32_t stored = DT_WORK_MODE_BACKUP_MAGIC | (uint32_t)mode;
+  uint32_t was_writable = PWR->CR1 & PWR_CR1_DBP;
+  DT_ModeRestartPending = DT_ModeRestartScheduled = 0U;
+  DT_ModeRestartOnNotify = 0U;
+  HAL_PWR_EnableBkUpAccess();
+  HAL_RTCEx_BKUPWrite(&hrtc, DT_WORK_MODE_BACKUP_REGISTER, stored);
+  if (HAL_RTCEx_BKUPRead(&hrtc, DT_WORK_MODE_BACKUP_REGISTER) == stored)
+  {
+    DT_ConfiguredWorkMode = mode;
+    DT_WorkModeResult = DT_WORK_MODE_RESULT_OK;
+    DT_Log((mode == CUSTOM_APP_WORK_MODE_INSPECTION) ?
+           "MODE: inspection saved; applies after reset\r\n" :
+           "MODE: online saved; applies after reset\r\n");
+  }
+  else
+  {
+    DT_WorkModeResult = DT_WORK_MODE_RESULT_SAVE_FAILED;
+    DT_Log("MODE: backup save/verify failed\r\n");
+  }
+  if (was_writable == 0U) HAL_PWR_DisableBkUpAccess();
+}
+
+static void DT_QueueWorkModeStatus(void)
+{
+  DT_WorkModeReadPending = 1U;
+  DT_WorkModeReadAttempts = 0U;
+  DT_WorkModeSendPending = 1U;
+  DT_WorkModeSendAttempts = 0U;
+  DT_WorkModeReplyTick = 0U;
+  DT_ScheduleWorkMode();
+}
+
+/* 模式指令在公共队列中执行，保存后仅改变 configured，复位才应用广播策略。 */
+static CommResult DT_CommWorkMode(const CommRequest *request,uint8_t *active,uint8_t *configured)
+{
+  if(request->code==COMM_CMD_WORK_MODE_SET) DT_SaveWorkMode(request->mode);
+  else DT_WorkModeResult=DT_WORK_MODE_RESULT_OK;
+  if (request->code == COMM_CMD_WORK_MODE_SET &&
+      request->source.link == COMM_LINK_BLE && DT_WorkModeResult == COMM_OK)
+    DT_ModeRestartPending = DT_ConfiguredWorkMode != DT_ActiveWorkMode;
+  *active=DT_ActiveWorkMode;*configured=DT_ConfiguredWorkMode;
+  /* FE82 的可读快照延后更新；指令响应由 Comm_Process 按来源和请求序号返回。 */
+  DT_WorkModeReadPending=1U;DT_WorkModeReadAttempts=0U;DT_WorkModeReplyTick=0U;
+  if (Custom_App_Context.IsConnected != 0U)
+    DT_ScheduleWorkMode();
+  return (CommResult)DT_WorkModeResult;
+}
+
+/* FE81 events and FE82 readable snapshots share the common frame layout. */
+static void DT_ProcessWorkMode(uint32_t now)
+{
+  tBleStatus status;
+  CommResult sent;
+  char line[104];
+  uint8_t payload[3],read_value[COMM_HEADER_SIZE+3U];
+  if (DT_ModeRestartScheduled != 0U && (int32_t)(now - DT_ModeRestartTick) >= 0)
+  {
+    if (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY) != 0U ||
+        __HAL_FLASH_GET_FLAG(FLASH_FLAG_CFGBSY) != 0U) return;
+    DT_ModeRestartPending = DT_ModeRestartScheduled = 0U;
+    DT_Log("MODE: restarting to apply saved mode\r\n");
+    NVIC_SystemReset();
+    return;
+  }
+  if ((Custom_App_Context.IsConnected == 0U) ||
+      ((DT_WorkModeSendPending == 0U) && (DT_WorkModeReadPending == 0U)) ||
+      ((DT_WorkModeReplyTick != 0U) && ((int32_t)(now - DT_WorkModeReplyTick) < 0)))
+    return;
+  DT_WorkModeReplyTick = now + DT_WORK_MODE_REPLY_RETRY_MS;
+  payload[0]=DT_WorkModeResult;payload[1]=DT_ActiveWorkMode;payload[2]=DT_ConfiguredWorkMode;
+  if (DT_WorkModeReadPending != 0U)
+  {
+    /* 可读属性是状态快照，序号固定为 0；不能作为命令响应使用。 */
+    uint16_t length = Comm_EncodeFrame(read_value, sizeof(read_value), COMM_KIND_EVENT,
+                                       COMM_DATA_WORK_MODE, 0U, payload, sizeof(payload));
+    status = Custom_STM_App_Update_Char_Variable_Length(
+        CUSTOM_STM_SENSOR_CTRL, read_value, (uint8_t)length);
+    DT_WorkModeReadAttempts++;
+    if ((status == BLE_STATUS_SUCCESS) || (DT_WorkModeReadAttempts >= DT_WORK_MODE_REPLY_ATTEMPTS))
+      DT_WorkModeReadPending = 0U;
+  }
+  if ((DT_WorkModeSendPending == 0U) ||
+      (Custom_App_Context.Sensor_status_Notification_Status == 0U)) return;
+  sent = Comm_SendWorkMode(COMM_LINK_BLE, (CommResult)payload[0], payload[1], payload[2]);
+  DT_WorkModeSendAttempts++;
+  if ((sent == COMM_OK) || (DT_WorkModeSendAttempts == 1U))
+  {
+    (void)snprintf(line, sizeof(line), "MODE: unified FE81 result=%u active=%u saved=%u status=%u\r\n",
+        (unsigned int)sent,
+        (unsigned int)payload[1], (unsigned int)payload[2], (unsigned int)payload[0]);
+    DT_Log(line);
+  }
+  if (sent == COMM_OK)
+  {
+    DT_WorkModeSendPending = 0U;
+    if (DT_ModeRestartOnNotify != 0U && payload[0] == COMM_OK)
+      DT_ConfirmModeRestart(payload[2]);
+  }
+  else if (DT_WorkModeSendAttempts >= DT_WORK_MODE_REPLY_ATTEMPTS)
+  {
+    DT_WorkModeSendPending = 0U;
+    DT_Log("MODE: notification retries exhausted; query again\r\n");
+  }
+}
+
+static void DT_ScheduleWorkMode(void)
+{
+  UTIL_SEQ_SetTask(1U << CFG_TASK_DT_SEND_ID, CFG_SCH_PRIO_1);
+}
+
+static void DT_ConfirmModeRestart(uint8_t configured)
+{
+  if (DT_ModeRestartPending == 0U || DT_ModeRestartScheduled != 0U ||
+      configured != DT_ConfiguredWorkMode || configured == DT_ActiveWorkMode)
+    return;
+  DT_ModeRestartTick = HAL_GetTick() + DT_WORK_MODE_RESTART_DELAY_MS;
+  DT_ModeRestartScheduled = 1U;
+  DT_Log("MODE: saved mode reply queued; restart in 1500 ms\r\n");
+  DT_ScheduleWorkMode();
+}
+
+static void DT_ServiceWorkModeTask(void)
+{
+  /* The sequencer can run this while the Zigbee startup task is waiting.
+     The RTC callback only schedules the task and never calls ACI. */
+  DT_ProcessWorkMode(HAL_GetTick());
+  if (DT_WorkModeTimerReady != 0U &&
+      (Comm_HasPending() || DT_ModeRestartScheduled != 0U ||
+       (Custom_App_Context.IsConnected != 0U &&
+        (DT_WorkModeReadPending != 0U ||
+         (DT_WorkModeSendPending != 0U && Custom_App_Context.Sensor_status_Notification_Status != 0U)))))
+  {
+    HW_TS_Start(DT_WorkModeTimerId,
+                (DT_WORK_MODE_REPLY_RETRY_MS * 1000U + CFG_TS_TICK_VAL - 1U) / CFG_TS_TICK_VAL);
+  }
+}
+
 static void DT_HandleSensorCtrl(const uint8_t *payload, uint8_t length)
 {
   uint8_t sensor_mask;
@@ -1406,6 +1721,32 @@ static void DT_HandleSensorCtrl(const uint8_t *payload, uint8_t length)
 
   if ((payload == 0) || (length == 0U))
   {
+    return;
+  }
+
+  if ((payload[0] == DT_CMD_WORK_MODE_QUERY) || (payload[0] == DT_CMD_WORK_MODE_SET))
+  {
+    if ((payload[0] == DT_CMD_WORK_MODE_QUERY) && (length == 1U))
+    {
+      DT_WorkModeResult = DT_WORK_MODE_RESULT_OK;
+      DT_Log("MODE: query received\r\n");
+    }
+    else if ((payload[0] == DT_CMD_WORK_MODE_SET) && (length == 2U) &&
+             (payload[1] <= CUSTOM_APP_WORK_MODE_INSPECTION))
+    {
+      DT_SaveWorkMode(payload[1]);
+      if (DT_WorkModeResult == COMM_OK)
+      {
+        DT_ModeRestartPending = DT_ConfiguredWorkMode != DT_ActiveWorkMode;
+        DT_ModeRestartOnNotify = 1U;
+      }
+    }
+    else
+    {
+      DT_WorkModeResult = DT_WORK_MODE_RESULT_BAD_VALUE;
+      DT_Log("MODE: invalid command/value\r\n");
+    }
+    DT_QueueWorkModeStatus();
     return;
   }
 
@@ -1502,6 +1843,11 @@ static void DT_VibDrainTask(void)
 
 static void DT_SendTask(void)
 {
+  /* Also runs inside the Zigbee startup wait. HCI command masking protects
+     this task from issuing ACI calls while another command is in flight. */
+  Comm_Process();
+  DT_ServiceWorkModeTask();
+  if (CommStreamMode) { DT_CommSendTask(); return; }
   tBleStatus status = BLE_STATUS_SUCCESS;
   uint16_t payload_offset;
   uint16_t vib_packet_len;
@@ -1869,6 +2215,7 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
   if ((ZigbeeVibrationWindowActive == 0U) || (ZigbeeVibrationServicing != 0U))
     return;
   ZigbeeVibrationServicing = 1U;
+  uint8_t was_sampling = ZigbeeVibration.sampling_stopped == 0U;
   if (ZigbeeVibration.flash_errors == 0U &&
       ZigbeeVibrationStore_Service(0U) == HAL_ERROR) {
     ZigbeeVibration.flash_errors++;
@@ -1944,26 +2291,17 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
     }
 
     stage_started = HAL_GetTick();
-    for (uint16_t sample = 0U;
-         sample < accepted_count;
-         sample++)
+    for (uint16_t sample = 0U; sample < accepted_count; sample++)
     {
       const uint8_t *data = &VibFifoRawBuffer[sample * DT_VIB_FIFO_WORD_SIZE];
-      int16_t raw[3];
-
-      raw[0] = (int16_t)((uint16_t)data[1] | ((uint16_t)data[2] << 8U));
-      raw[1] = (int16_t)((uint16_t)data[3] | ((uint16_t)data[4] << 8U));
-      raw[2] = (int16_t)((uint16_t)data[5] | ((uint16_t)data[6] << 8U));
-      ZigbeeStoreSamples[sample][0] = raw[0];
-      ZigbeeStoreSamples[sample][1] = raw[1];
-      ZigbeeStoreSamples[sample][2] = raw[2];
-      ZigbeeVibration.sample_count++;
+      int16_t *xyz = ZigbeeStoreRing[ZigbeeStoreHead];
+      xyz[0] = (int16_t)((uint16_t)data[1] | ((uint16_t)data[2] << 8U));
+      xyz[1] = (int16_t)((uint16_t)data[3] | ((uint16_t)data[4] << 8U));
+      xyz[2] = (int16_t)((uint16_t)data[5] | ((uint16_t)data[6] << 8U));
+      if (++ZigbeeStoreHead == DT_ZB_STORE_RING_POINTS)
+        ZigbeeStoreHead = 0U;
     }
-    for (uint16_t i = 0U; i < accepted_count; ++i)
-    {
-      memcpy(ZigbeeStoreRing[ZigbeeStoreHead], ZigbeeStoreSamples[i], 6U);
-      ZigbeeStoreHead = (ZigbeeStoreHead + 1U) % DT_ZB_STORE_RING_POINTS;
-    }
+    ZigbeeVibration.sample_count += accepted_count;
     ZigbeeStoreCount += accepted_count;
     ZigbeeVibration.diag_pack_ms += HAL_GetTick() - stage_started;
     if (ZigbeeStoreCount > ZigbeeVibration.diag_ring_peak)
@@ -1983,13 +2321,12 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
       (ZigbeeVibration.overrun_seen == 0U) &&
       (ZigbeeVibration.buffer_overruns == 0U) &&
       (ZigbeeVibration.timed_out == 0U) &&
-      (ZigbeeStoreCount >= DT_ZB_STORE_WRITE_POINTS))
+      (ZigbeeStoreCount >= DT_ZB_STORE_REFILL_POINTS))
   {
-    /* QSPI TX and internal NOR programming proceed independently of SPI.
-       Drain as much as the two page buffers can accept without waiting. */
+    /* Start feeding NOR when one page of samples is queued. Keep the
+       per-task budget separate so a watermark burst can be drained promptly. */
     if (DT_DrainZigbeeStore(DT_ZB_STORE_WRITE_POINTS) != HAL_OK)
       ZigbeeVibration.flash_errors++;
-
   }
 
   if ((ZigbeeVibration.sampling_stopped != 0U) &&
@@ -2023,6 +2360,13 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
 
   if (ZigbeeVibration.sampling_stopped != 0U)
   {
+    if (was_sampling != 0U)
+    {
+      ZigbeeVibrationWriteStats_t stats;
+      ZigbeeVibrationStore_GetWriteStats(&stats);
+      ZigbeeCaptureCommittedBytes = stats.bytes;
+      ZigbeeCaptureWriteMs = HAL_GetTick() - ZigbeeVibration.diag_start_ms;
+    }
     HAL_StatusTypeDef flush_status = ZigbeeVibrationStore_Service(ZigbeeStoreCount == 0U);
     if (flush_status == HAL_ERROR) {
       ZigbeeVibration.flash_errors++;
@@ -2063,6 +2407,28 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
                      (unsigned int)ZigbeeVibration.diag_ring_peak,
                      (unsigned long)ZigbeeVibration.diag_drained_bytes);
       DT_Log(log_line);
+      ZigbeeVibrationWriteStats_t stats;
+      ZigbeeVibrationStore_GetWriteStats(&stats);
+      (void)snprintf(log_line, sizeof(log_line),
+                     "VIB-NOR: erase_ms=%lu capture_ms=%lu capture_bytes=%lu drain_ms=%lu drain_bytes=%lu\r\n",
+                     (unsigned long)stats.erase_ms,
+                     (unsigned long)ZigbeeCaptureWriteMs,
+                     (unsigned long)ZigbeeCaptureCommittedBytes,
+                     (unsigned long)(capture_elapsed - ZigbeeCaptureWriteMs),
+                     (unsigned long)(stats.bytes - ZigbeeCaptureCommittedBytes));
+      DT_Log(log_line);
+      QspiNor_ProgramTiming_t timing = QspiNor_GetProgramTiming();
+      (void)snprintf(log_line, sizeof(log_line),
+                     "VIB-NOR-CYCLES: hz=%lu pages=%lu setup=%lu tx=%lu poll_delay=%lu poll=%lu done_delay=%lu max_gap=%lu\r\n",
+                     (unsigned long)timing.clock_hz,
+                     (unsigned long)timing.pages,
+                     (unsigned long)timing.setup_cycles,
+                     (unsigned long)timing.tx_cycles,
+                     (unsigned long)timing.poll_start_delay_cycles,
+                     (unsigned long)timing.poll_cycles,
+                     (unsigned long)timing.completion_delay_cycles,
+                     (unsigned long)timing.max_gap_cycles);
+      DT_Log(log_line);
       DT_UpdateLowPowerLock();
     }
     else
@@ -2078,7 +2444,8 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
        remained above its watermark, its IRQ line will stay high and produce
        no new edge, so explicitly queue another drain task. */
     if ((ZigbeeFifoReadPending != 0U) ||
-        (ZigbeeStoreCount >= DT_ZB_STORE_WRITE_POINTS) ||
+        ((ZigbeeStoreCount >= DT_ZB_STORE_REFILL_POINTS) &&
+         (ZigbeeVibrationStore_AsyncCapacity() != 0U)) ||
         ((Vibrometer_ReadFifoStatus(&fifo_count, &fifo_flags) == HAL_OK) &&
          (fifo_count >= 128U)))
     {
@@ -2235,4 +2602,349 @@ static HAL_StatusTypeDef DT_VibBuildPacket(uint16_t *packet_len, uint16_t *sampl
 void Custom_APP_ZigbeeAbortSnapshot(void)
 {
   DT_AbortZigbeeSnapshot();
+}
+
+/* Unified acquisition adapter: peripheral start/stop functions above remain the
+ * sole owners of the sensor drivers. The same command executor serves BLE/ZB. */
+void Custom_APP_ProtocolMtu(uint16_t handle, uint16_t mtu)
+{
+  if (Custom_App_Context.IsConnected && handle==Custom_App_Context.ConnectionHandle && mtu>=23U)
+    CommBleCapacity=(mtu-3U>COMM_FRAME_MAX)?COMM_FRAME_MAX:(uint16_t)(mtu-3U);
+}
+
+uint8_t Custom_APP_ProtocolStreaming(void)
+{
+  return CommStreamMode && (DT_CommActiveMask()!=0U || CommDraining || CommStoredCapture);
+}
+
+static uint16_t DT_CommActiveMask(void)
+{
+  if(CommStoredCapture)return CommStoredMask;
+  uint16_t mask=Custom_App_Context.SensorStreaming ?
+      Comm_MaskFromBle(Custom_App_Context.SensorEnableMask):0U;
+  if(Custom_App_Context.VibStreaming && !CommDraining)mask|=COMM_SENSOR_VIBRATION;
+  return mask;
+}
+
+static uint8_t DT_CommReady(uint8_t vibration)
+{
+  if(CommStreamMode && CommStreamLink==COMM_LINK_ZIGBEE)
+    return APP_ZIGBEE_ProtocolReady();
+  return Custom_App_Context.IsConnected &&
+      (vibration?Custom_App_Context.Vib_wave_Notification_Status:
+                  Custom_App_Context.Sensor_status_Notification_Status);
+}
+
+static CommResult DT_CommBleSend(const CommSource *source,const uint8_t *frame,uint16_t length)
+{
+  if(source->session!=CommBleSession || !Custom_App_Context.IsConnected)return COMM_NOT_READY;
+  uint8_t wave=frame[1]==COMM_KIND_DATA && frame[2]==COMM_DATA_WAVE;
+  if(!(wave?Custom_App_Context.Vib_wave_Notification_Status:
+             Custom_App_Context.Sensor_status_Notification_Status))return COMM_NOT_READY;
+  if(length>CommBleCapacity || (!wave && length>80U))return COMM_BAD_LENGTH;
+  tBleStatus result=Custom_STM_App_Update_Char_Variable_Length(
+      wave?CUSTOM_STM_VIB_WAVE:CUSTOM_STM_SENSOR_STATUS,(uint8_t *)frame,length);
+  if(result==BLE_STATUS_SUCCESS) {
+    if (length >= COMM_HEADER_SIZE + 3U &&
+        frame[1] == COMM_KIND_RESPONSE && frame[2] == COMM_CMD_WORK_MODE_SET &&
+        frame[COMM_HEADER_SIZE] == COMM_OK)
+      DT_ConfirmModeRestart(frame[COMM_HEADER_SIZE + 2U]);
+    return COMM_OK;
+  }
+  if(result==BLE_STATUS_BUSY || result==BLE_STATUS_INSUFFICIENT_RESOURCES)return COMM_BUSY;
+  return COMM_NOT_READY;
+}
+
+static void DT_CommQueueStatus(uint8_t status,uint16_t mask)
+{
+  if(status>COMM_STATUS_OVERFLOW || !mask)return;
+  for(unsigned i=0;i<5;i++)CommStatusByCode[i]&=(uint16_t)~mask;
+  CommStatusByCode[status]|=mask;CommStatusMask|=mask;
+}
+
+static void DT_CommStop(uint16_t mask)
+{
+  uint16_t active=DT_CommActiveMask();
+  if((mask & active & COMM_SENSOR_SCALARS) && CommStreamMode) {
+    /* Preserve the last available measurements before putting peripherals to sleep. */
+    DT_CommCollectScalars(&CommFinalScalars);
+    CommFinalScalars.valid_mask&=mask;
+    CommFinalPending=CommFinalScalars.valid_mask!=0;
+  }
+  if(mask & COMM_SENSOR_SCALARS)
+    DT_ApplySensorEnableMask(Comm_MaskToBle(active & (uint16_t)~mask));
+  if((mask & COMM_SENSOR_VIBRATION) && Custom_App_Context.VibStreaming && !CommDraining) {
+    if(CommStreamMode && Vibrometer_StopSamplingKeepFifo()==HAL_OK) {
+      CommDraining=1U;CommDrainStatus=COMM_STATUS_STOPPED;
+    } else DT_StopVibStream();
+  }
+  CommTimedMask&=(uint16_t)~mask;
+}
+
+static CommResult DT_CommExecute(const CommRequest *r,uint16_t *active)
+{
+  *active=DT_CommActiveMask();
+  if(r->code==COMM_CMD_STATUS) {
+    if(ZigbeeAudioWindowActive || ZigbeeVibrationWindowActive)
+      *active|=Comm_MaskFromZigbee(ZigbeeSensorEnableMask);
+    return COMM_OK;
+  }
+  if(r->code==COMM_CMD_WINDOW) {
+    /* No mid-batch clock changes; timed windows are acquisition durations,
+     * independent of the microphones' existing RMS integration windows. */
+    if(*active & r->mask)return COMM_BUSY;
+    for(unsigned i=0;i<5;i++)if(r->mask&(1U<<i))CommWindows[i]=r->duration_ms;
+    return COMM_OK;
+  }
+  if(r->code==COMM_CMD_DECIMATION) {
+    if(*active & COMM_SENSOR_VIBRATION)return COMM_BUSY;
+    CommFactor=r->factor;return COMM_OK;
+  }
+  if(r->code!=COMM_CMD_SENSOR_ENABLE)return COMM_UNSUPPORTED;
+  if(CommStoredCapture) {
+    if(r->state==COMM_START)return (r->mask & ~CommStoredMask)?COMM_BUSY:COMM_OK;
+    uint16_t stopped=CommStoredMask & r->mask;
+    if(stopped & COMM_SENSOR_VIBRATION) {
+      ZigbeeSensorEnableMask&=(uint8_t)~CUSTOM_APP_ZB_SENSOR_VIBRATION;
+      if(ZigbeeVibrationWindowActive) {
+        ZigbeeVibrationWindowActive=0;Vibrometer_Stop();
+        ZigbeeVibrationStore_Abort();ZigbeeVibrationStoreActive=0;
+      }
+    }
+    if(stopped & COMM_SENSOR_DIGITAL_MIC) {DigitalMicrophone_Stop();ZigbeeDigitalMicStarted=0;}
+    if(stopped & COMM_SENSOR_ANALOG_MIC) {AnalogMicrophone_Stop();ZigbeeAnalogMicStarted=0;}
+    if(stopped & COMM_SENSOR_TEMPERATURE)(void)Thermometer_EnterLowPower();
+    if(stopped & COMM_SENSOR_MAGNETIC)(void)Magnetometer_EnterLowPower();
+    CommStoredMask&=(uint16_t)~stopped;ZigbeeCaptureMask&=(uint16_t)~stopped;
+    CommStoredRequested&=(uint16_t)~stopped;
+    *active=CommStoredMask;DT_CommQueueStatus(COMM_STATUS_STOPPED,stopped);
+    return COMM_OK;
+  }
+  /* Scheduled A-version Flash capture is a separate resource owner. Never
+   * interrupt it behind its state machine, or corrupt a persisted batch. */
+  if(ZigbeeAudioWindowActive || ZigbeeVibrationWindowActive || APP_ZIGBEE_IsMeasuring())return COMM_BUSY;
+  if(r->state==COMM_STOP) {
+    uint16_t stopped=*active & r->mask;
+    DT_CommStop(r->mask);*active=DT_CommActiveMask();
+    if(stopped && CommStreamMode) DT_CommQueueStatus(COMM_STATUS_STOPPED,stopped & (uint16_t)~(CommDraining?COMM_SENSOR_VIBRATION:0U));
+    return COMM_OK;
+  }
+  uint16_t added=r->mask & (uint16_t)~*active;
+  if(!added)return COMM_OK; /* retry must not restart a sampling window */
+  if(*active && (!CommStreamMode || CommStreamLink!=r->source.link))return COMM_BUSY;
+  if(CommFrameLength || CommStatusMask || CommDraining || CommFinalPending)return COMM_BUSY;
+  if(r->source.link==COMM_LINK_BLE) {
+    if(!Custom_App_Context.IsConnected || !Custom_App_Context.Sensor_status_Notification_Status)
+      return COMM_NOT_READY; /* responses and batch metadata use FE81 */
+    if((added & COMM_SENSOR_SCALARS) && CommBleCapacity<32U)return COMM_NOT_READY;
+    if((added & COMM_SENSOR_VIBRATION) &&
+       (!Custom_App_Context.Vib_wave_Notification_Status || CommBleCapacity<26U))return COMM_NOT_READY;
+  } else if(!APP_ZIGBEE_ProtocolReady() || APP_ZIGBEE_IsPendingAuthorization() || APP_ZIGBEE_IsTransmitting())return COMM_NOT_READY;
+  if(r->source.link==COMM_LINK_ZIGBEE && (added & COMM_SENSOR_VIBRATION) &&
+      CommWindows[4] && CommFactor==1U && !*active) {
+    uint32_t window=CommWindows[4];
+    uint32_t dmic=CommWindows[2]?CommWindows[2]:500U;
+    uint32_t amic=CommWindows[3]?CommWindows[3]:500U;
+    if((window!=500U && window!=1000U && window!=1500U) ||
+       ((added & COMM_SENSOR_DIGITAL_MIC) && dmic!=500U && dmic!=1000U && dmic!=1500U && dmic!=2000U) ||
+       ((added & COMM_SENSOR_ANALOG_MIC) && amic!=500U && amic!=1000U && amic!=1500U && amic!=2000U))return COMM_BAD_VALUE;
+    CommStreamMode=1U;CommStreamLink=r->source.link;CommStoredCapture=1U;
+    CommStoredRequested=CommStoredMask=added;CommBatchId=APP_ZIGBEE_ProtocolNextBatch();
+    uint8_t legacy=1U | ((added&COMM_SENSOR_DIGITAL_MIC)?2U:0U) | ((added&COMM_SENSOR_ANALOG_MIC)?4U:0U);
+    if(!Custom_APP_ZigbeeBeginSnapshot(COMM_VIB_RATE_HZ,(uint16_t)window,(uint16_t)dmic,(uint16_t)amic,legacy,CommBatchId)) {
+      CommStoredCapture=0;DT_AbortZigbeeSnapshot();*active=0;return COMM_HARDWARE_ERROR;
+    }
+    *active=added;DT_CommQueueStatus(COMM_STATUS_SAMPLING,added);return COMM_OK;
+  }
+  CommStreamMode=1U;CommStreamLink=r->source.link;
+  if(!*active) {CommBatchId=APP_ZIGBEE_ProtocolNextBatch();CommBatchPending=1U;CommActiveFactor=CommFactor;}
+  if(added & COMM_SENSOR_VIBRATION) {
+    /* Starting a new waveform establishes its own immutable index/rate. */
+    if(*active) {CommBatchId=APP_ZIGBEE_ProtocolNextBatch();CommBatchPending=1U;}
+    CommRawIndex=0;CommPhase=0;CommActiveFactor=CommFactor;
+    DT_StartVibStream();
+  }
+  if(added & COMM_SENSOR_SCALARS)
+    DT_ApplySensorEnableMask(Comm_MaskToBle(*active | added));
+  uint16_t actual=DT_CommActiveMask();
+  if((actual & added)!=added) {
+    DT_CommStop(added);*active=DT_CommActiveMask();return COMM_HARDWARE_ERROR;
+  }
+  uint32_t now=HAL_GetTick();
+  for(unsigned i=0;i<5;i++)if(added&(1U<<i)) {
+    if(CommWindows[i]) {CommTimedMask|=(uint16_t)(1U<<i);CommDeadlines[i]=now+CommWindows[i];}
+    else CommTimedMask&=(uint16_t)~(1U<<i);
+  }
+  *active=actual;DT_CommQueueStatus(COMM_STATUS_SAMPLING,added);
+  CommRetryAt=now;
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
+  return COMM_OK;
+}
+
+static void DT_CommPoll(uint32_t now)
+{
+  if(!CommStreamMode)return;
+  if(CommStoredCapture && Custom_APP_ZigbeeSnapshotReady()) {
+    Custom_APP_ZigbeeSnapshot_t snapshot;
+    Custom_APP_ZigbeeFinishSnapshot(&snapshot);
+    uint16_t completed=CommStoredMask;
+    CommStoredCapture=0;CommStoredMask=0;
+    CommResult committed=APP_ZIGBEE_ProtocolSubmit(CommBatchId,&snapshot);
+    uint16_t valid=snapshot.valid_mask & completed;
+    if(committed!=COMM_OK)valid=0;
+    DT_CommQueueStatus(COMM_STATUS_COMPLETE,valid);
+    DT_CommQueueStatus(COMM_STATUS_FAULT,completed & (uint16_t)~valid);
+  }
+  if(CommStoredCapture) {
+    if(CommStatusMask)UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
+    return;
+  }
+  uint16_t expired=0;
+  for(unsigned i=0;i<5;i++)if((CommTimedMask&(1U<<i)) && (int32_t)(now-CommDeadlines[i])>=0)
+    expired|=(uint16_t)(1U<<i);
+  if(expired) {
+    DT_CommStop(expired);
+    if((expired & COMM_SENSOR_VIBRATION) && CommDraining)CommDrainStatus=COMM_STATUS_COMPLETE;
+    DT_CommQueueStatus(COMM_STATUS_COMPLETE,expired & (uint16_t)~(CommDraining?COMM_SENSOR_VIBRATION:0U));
+  }
+  if(!DT_CommReady(0U) && DT_CommActiveMask()) {
+    DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();CommDraining=0;CommFrameLength=0;
+    DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_ALL);
+  }
+  /* Existing BLE loop handles its audio; Zigbee's common stream uses the same
+   * processing function even without a phone connection. */
+  if(CommStreamLink==COMM_LINK_ZIGBEE)DT_ProcessBleAudio(now);
+  if((DT_CommActiveMask() || CommDraining || CommFinalPending || CommFrameLength || CommStatusMask || CommBatchPending ||
+      Custom_App_Context.SensorSendPending) && (int32_t)(now-CommRetryAt)>=0)
+    UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
+}
+
+static void DT_CommCollectScalars(CommScalars *values)
+{
+  uint8_t data[6];uint16_t mask=DT_CommActiveMask();memset(values,0,sizeof(*values));
+  if((mask&COMM_SENSOR_TEMPERATURE) && Thermometer_AppendPayload(data,sizeof(data))==2U) {
+    values->valid_mask|=COMM_SENSOR_TEMPERATURE;values->temperature_centi_c=(int16_t)Comm_ReadU16(data);
+  }
+  if((mask&COMM_SENSOR_MAGNETIC) && Magnetometer_AppendPayload(data,sizeof(data))==6U) {
+    values->valid_mask|=COMM_SENSOR_MAGNETIC;
+    for(unsigned a=0;a<3;a++)values->magnetic_0p1_ut[a]=(int16_t)Comm_ReadU16(data+2*a);
+  }
+  if((mask&COMM_SENSOR_DIGITAL_MIC) && DigitalMicrophone_AppendPayload(data,sizeof(data))==1U) {
+    values->valid_mask|=COMM_SENSOR_DIGITAL_MIC;values->digital_centi_db=(uint16_t)data[0]*100U;
+  }
+  if((mask&COMM_SENSOR_ANALOG_MIC) && AnalogMicrophone_AppendPayload(data,sizeof(data))==1U) {
+    values->valid_mask|=COMM_SENSOR_ANALOG_MIC;values->analog_centi_db=(uint16_t)data[0]*100U;
+  }
+}
+
+static void DT_CommSendTask(void)
+{
+  uint32_t now=HAL_GetTick();
+  if((int32_t)(now-CommRetryAt)<0)return;
+  CommRetryAt=now+1U;
+  CommResult result;
+  /* A batch description must precede every waveform. Retain it on congestion. */
+  if(CommBatchPending) {
+    result=Comm_SendBatch(CommStreamLink,CommBatchId,CommActiveFactor);
+    if(result==COMM_OK)CommBatchPending=0;
+    return;
+  }
+  if(CommFinalPending && !CommFrameLength) {
+    result=Comm_SendScalars(CommStreamLink,CommBatchId,&CommFinalScalars);
+    if(result==COMM_OK)CommFinalPending=0;
+    return;
+  }
+  if(CommStatusMask && !CommFrameLength) {
+    for(unsigned status=0;status<5;status++)if(CommStatusByCode[status]) {
+      result=Comm_SendStatus(CommStreamLink,(uint8_t)status,CommStatusByCode[status]);
+      if(result==COMM_OK) {CommStatusMask&=(uint16_t)~CommStatusByCode[status];CommStatusByCode[status]=0;}
+      break;
+    }
+    return;
+  }
+  uint16_t capacity=CommStreamLink==COMM_LINK_BLE?CommBleCapacity:COMM_ZB_FRAME_MAX;
+  if(!CommFrameLength && Custom_App_Context.SensorSendPending) {
+    CommScalars values;DT_CommCollectScalars(&values);
+    uint16_t n=Comm_EncodeScalars(CommFrame+COMM_HEADER_SIZE,sizeof(CommFrame)-COMM_HEADER_SIZE,CommBatchId,&values);
+    CommFrameCode=COMM_DATA_SCALARS;
+    CommFrameLength=Comm_EncodeFrame(CommFrame,sizeof(CommFrame),COMM_KIND_DATA,CommFrameCode,
+        Custom_App_Context.SensorSeq++,CommFrame+COMM_HEADER_SIZE,n);
+    Custom_App_Context.SensorSendPending=0;
+    Custom_App_Context.SensorAudioReportedMask|=Comm_MaskToBle(values.valid_mask)&6U;
+  }
+  if(!CommFrameLength && Custom_App_Context.VibStreaming) {
+    uint16_t fifo_count=0;uint8_t flags=0;
+    if(Vibrometer_ReadFifoStatus(&fifo_count,&flags)!=HAL_OK) {
+      DT_StopVibStream();CommDraining=0;CommTimedMask&=(uint16_t)~COMM_SENSOR_VIBRATION;
+      DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_VIBRATION);return;
+    }
+    if(flags & VIBROMETER_FIFO_OVERRUN_FLAG) {
+      /* Never invent sample indices across lost hardware samples, and never
+       * silently change the decimation factor to hide a slow receiver. */
+      DT_StopVibStream();CommDraining=0;CommTimedMask&=(uint16_t)~COMM_SENSOR_VIBRATION;
+      DT_CommQueueStatus(COMM_STATUS_OVERFLOW,COMM_SENSOR_VIBRATION);return;
+    }
+    if(capacity<COMM_HEADER_SIZE+COMM_WAVE_PREFIX_SIZE+6U)return;
+    unsigned max_points=(capacity-COMM_HEADER_SIZE-COMM_WAVE_PREFIX_SIZE)/6U;
+    uint16_t raw=(uint16_t)(max_points*CommActiveFactor);
+    if(raw>fifo_count)raw=fifo_count;
+    if(raw>VIBROMETER_FIFO_DMA_MAX_BYTES/7U)raw=VIBROMETER_FIFO_DMA_MAX_BYTES/7U;
+    if(!raw) {
+      if(CommDraining) {
+        DT_StopVibStream();CommDraining=0;
+        DT_CommQueueStatus(CommDrainStatus,COMM_SENSOR_VIBRATION);
+      }
+      return;
+    }
+    if(CommRawIndex>UINT32_MAX-raw) {
+      DT_StopVibStream();CommDraining=0;CommTimedMask&=(uint16_t)~COMM_SENSOR_VIBRATION;
+      DT_CommQueueStatus(COMM_STATUS_COMPLETE,COMM_SENSOR_VIBRATION);return;
+    }
+    if(Vibrometer_ReadFifoData(VibFifoRawBuffer,(uint16_t)(raw*7U))!=HAL_OK) {
+      DT_StopVibStream();CommDraining=0;CommTimedMask&=(uint16_t)~COMM_SENSOR_VIBRATION;
+      DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_VIBRATION);return;
+    }
+    uint16_t points=0;uint32_t first=CommRawIndex;
+    for(unsigned i=0;i<raw;i++) {
+      if(!CommPhase) {
+        if(!points)first=CommRawIndex;
+        for(unsigned a=0;a<3;a++)CommSamples[points][a]=(int16_t)Comm_ReadU16(VibFifoRawBuffer+i*7U+1U+a*2U);
+        points++;
+      }
+      CommPhase=(uint16_t)((CommPhase+1U)%CommActiveFactor);CommRawIndex++;
+    }
+    if(!points)return;
+    uint16_t n=Comm_EncodeWave(CommFrame+COMM_HEADER_SIZE,sizeof(CommFrame)-COMM_HEADER_SIZE,
+                             CommBatchId,first,CommSamples,points);
+    CommFrameCode=COMM_DATA_WAVE;
+    CommFrameLength=Comm_EncodeFrame(CommFrame,sizeof(CommFrame),COMM_KIND_DATA,CommFrameCode,
+        Custom_App_Context.VibSeq++,CommFrame+COMM_HEADER_SIZE,n);
+  }
+  if(!CommFrameLength)return;
+  result=Comm_SendFrame(CommStreamLink,CommFrame,CommFrameLength);
+  if(result==COMM_OK) {
+    CommFrameLength=0;
+    /* Drain promptly while stack buffers allow it; other sequencer tasks run
+     * between packets. BUSY retains the exact bytes and raw point indices. */
+    CommRetryAt=now;
+    if(Custom_App_Context.VibStreaming)UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
+  } else if(result==COMM_BUSY)CommRetryAt=now+DT_BLE_BUSY_RETRY_PERIOD_MS;
+  else {
+    CommFrameLength=0;DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();CommDraining=0;
+    DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_ALL);
+  }
+}
+
+/* 配置按字节序列保存，避免结构体填充；导入先完整校验，失败不部分覆盖。 */
+void Custom_APP_ProtocolExportSettings(uint8_t out[22])
+{
+  for(unsigned i=0;i<5;i++)Comm_WriteU32(out+4*i,CommWindows[i]);
+  Comm_WriteU16(out+20,CommFactor);
+}
+uint8_t Custom_APP_ProtocolImportSettings(const uint8_t in[22])
+{
+  if(!in || !Comm_ReadU16(in+20) || Comm_ReadU16(in+20)>COMM_MAX_DECIMATION)return 0;
+  for(unsigned i=0;i<5;i++)if(Comm_ReadU32(in+4*i)>COMM_MAX_WINDOW_MS)return 0;
+  for(unsigned i=0;i<5;i++)CommWindows[i]=Comm_ReadU32(in+4*i);
+  CommFactor=Comm_ReadU16(in+20);return 1;
 }

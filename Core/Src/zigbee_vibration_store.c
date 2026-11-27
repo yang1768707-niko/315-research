@@ -47,6 +47,8 @@ typedef struct
 static ZigbeeVibrationFlashHeader_t s_headers[ZB_VIB_MAX_SLOTS];
 /* 0=recyclable, 1=pending, 2=acknowledged, 3=quarantined, 4=capturing. */
 static uint8_t s_states[ZB_VIB_MAX_SLOTS];
+static uint32_t s_upload_batch;
+static ZigbeeVibrationOverwrite_t s_overwrite;
 static unsigned s_slot_count;
 static unsigned s_active_slot;
 static unsigned s_next_slot;
@@ -59,10 +61,10 @@ static uint32_t s_batch_id;
 static uint16_t s_sample_rate_hz;
 static uint8_t s_ready;
 static uint8_t s_capturing;
-static uint8_t s_page_buffer[QSPI_NOR_PAGE_SIZE];
+static uint8_t s_pages[2][QSPI_NOR_PAGE_SIZE];
+static uint8_t s_fill_page;
 static uint16_t s_page_used;
 static ZigbeeVibrationWriteStats_t s_write_stats;
-static uint8_t s_dma_page[QSPI_NOR_PAGE_SIZE];
 static uint16_t s_dma_length;
 static uint32_t s_dma_started;
 
@@ -70,11 +72,12 @@ static HAL_StatusTypeDef Store_StartPage(void)
 {
   if (s_dma_length != 0U) return HAL_BUSY;
   if (s_page_used == 0U) return HAL_OK;
-  memcpy(s_dma_page, s_page_buffer, s_page_used);
-  if (QspiNor_ProgramPageAsync(s_write_address, s_dma_page, s_page_used) != HAL_OK)
+  if (QspiNor_ProgramPageAsync(s_write_address, s_pages[s_fill_page], s_page_used) != HAL_OK)
     return HAL_ERROR;
   s_dma_length = s_page_used;
   s_dma_started = HAL_GetTick();
+  /* Keep the page handed to DMA immutable until ProgramService confirms it. */
+  s_fill_page ^= 1U;
   s_page_used = 0U;
   return HAL_OK;
 }
@@ -119,7 +122,7 @@ HAL_StatusTypeDef ZigbeeVibrationStore_AppendAsync(const int16_t samples[][3], u
   for (uint32_t offset = 0U; offset < bytes;) {
     uint32_t take = QSPI_NOR_PAGE_SIZE - s_page_used;
     if (take > bytes - offset) take = bytes - offset;
-    memcpy(s_page_buffer + s_page_used, raw + offset, take);
+    memcpy(s_pages[s_fill_page] + s_page_used, raw + offset, take);
     s_page_used += take;
     offset += take;
     if (s_page_used == QSPI_NOR_PAGE_SIZE && s_dma_length == 0U && Store_StartPage() != HAL_OK)
@@ -138,7 +141,7 @@ static HAL_StatusTypeDef ZigbeeVibrationStore_FlushPage(void)
     return HAL_OK;
   }
   started = HAL_GetTick();
-  if (QspiNor_Write(s_write_address, s_page_buffer, s_page_used) != HAL_OK)
+  if (QspiNor_Write(s_write_address, s_pages[s_fill_page], s_page_used) != HAL_OK)
   {
     s_capturing = 0U;
     s_states[s_active_slot] = 0U;
@@ -195,6 +198,8 @@ HAL_StatusTypeDef ZigbeeVibrationStore_Init(uint32_t *jedec_id,
 
   s_ready = 0U;
   s_capturing = 0U;
+  s_upload_batch = 0U;
+  memset(&s_overwrite, 0, sizeof(s_overwrite));
   if (QspiNor_Init(jedec_id, &capacity) != HAL_OK)
   {
     return HAL_ERROR;
@@ -251,6 +256,8 @@ HAL_StatusTypeDef ZigbeeVibrationStore_Begin(uint16_t sample_rate_hz,
                                              uint32_t batch_id)
 {
   unsigned selected = s_slot_count;
+  unsigned acknowledged = s_slot_count;
+  unsigned oldest = s_slot_count;
   uint32_t expected_samples;
   uint32_t expected_bytes;
 
@@ -277,15 +284,34 @@ HAL_StatusTypeDef ZigbeeVibrationStore_Begin(uint16_t sample_rate_hz,
     {
       return HAL_ERROR;
     }
-    if ((selected == s_slot_count) &&
-        ((s_states[slot] == 0U) || (s_states[slot] == 2U)))
-    {
-      selected = slot;
-    }
+    if ((selected == s_slot_count) && (s_states[slot] == 0U)) selected = slot;
+    if ((acknowledged == s_slot_count) && (s_states[slot] == 2U)) acknowledged = slot;
+    if ((s_states[slot] == 1U) &&
+        (s_headers[slot].collection_id != s_upload_batch) &&
+        ((oldest == s_slot_count) ||
+         ((int32_t)(s_headers[slot].sequence - s_headers[oldest].sequence) < 0)))
+      oldest = slot;
   }
+  if (selected == s_slot_count) selected = acknowledged;
+  if (selected == s_slot_count) selected = oldest;
   if (selected == s_slot_count)
   {
     return HAL_BUSY;
+  }
+
+  if (s_states[selected] == 1U)
+  {
+    /* Commit the loss before any erase can partly alter waveform bytes. On
+       power loss Init must never resurrect a header for a partly erased batch. */
+    uint32_t invalid = 0U, check = UINT32_MAX;
+    uint32_t header_address = selected * ZB_VIB_SLOT_BYTES + ZB_VIB_HEADER_OFFSET;
+    if (QspiNor_Write(header_address, (const uint8_t *)&invalid, sizeof(invalid)) != HAL_OK ||
+        QspiNor_Read(header_address, (uint8_t *)&check, sizeof(check)) != HAL_OK || check != invalid)
+      return HAL_ERROR;
+    s_overwrite.discarded_batch = s_headers[selected].collection_id;
+    s_overwrite.replacement_batch = batch_id;
+    s_overwrite.slot = selected;
+    s_states[selected] = 0U;
   }
 
   s_active_slot = selected;
@@ -297,14 +323,18 @@ HAL_StatusTypeDef ZigbeeVibrationStore_Begin(uint16_t sample_rate_hz,
   s_sample_rate_hz = sample_rate_hz;
   s_running_crc = UINT32_MAX;
   s_write_address = selected * ZB_VIB_SLOT_BYTES + ZB_VIB_DATA_OFFSET;
+  s_fill_page = 0U;
   s_page_used = 0U;
   memset(&s_write_stats, 0, sizeof(s_write_stats));
+  uint32_t erase_started = HAL_GetTick();
   if (QspiNor_EraseRange(selected * ZB_VIB_SLOT_BYTES,
                          ZB_VIB_DATA_OFFSET + expected_bytes) != HAL_OK)
   {
     s_states[selected] = 0U;
     return HAL_ERROR;
   }
+  s_write_stats.erase_ms = HAL_GetTick() - erase_started;
+  QspiNor_ResetProgramTiming();
   s_capturing = 1U;
   return HAL_OK;
 }
@@ -335,7 +365,7 @@ HAL_StatusTypeDef ZigbeeVibrationStore_Append(const int16_t samples[][3],
       {
         take = left;
       }
-      memcpy(&s_page_buffer[s_page_used], &raw[offset], take);
+      memcpy(&s_pages[s_fill_page][s_page_used], &raw[offset], take);
       s_page_used += (uint16_t)take;
       offset += take;
       if ((s_page_used == QSPI_NOR_PAGE_SIZE) &&
@@ -460,6 +490,26 @@ int ZigbeeVibrationStore_Pending(uint8_t descriptor[V2_BATCH_LEN])
   return ZigbeeVibrationStore_DescribeBatch(0U, descriptor);
 }
 
+int ZigbeeVibrationStore_ProtectBatch(uint32_t batch)
+{
+  if (batch == 0U) { s_upload_batch = 0U; return 1; }
+  if (!s_ready || (s_upload_batch && s_upload_batch != batch)) return 0;
+  for (unsigned slot = 0U; slot < s_slot_count; ++slot)
+    if (s_states[slot] == 1U && s_headers[slot].collection_id == batch) {
+      s_upload_batch = batch;
+      return 1;
+    }
+  return 0;
+}
+
+int ZigbeeVibrationStore_TakeOverwrite(ZigbeeVibrationOverwrite_t *event)
+{
+  if (!event || !s_overwrite.discarded_batch) return 0;
+  *event = s_overwrite;
+  memset(&s_overwrite, 0, sizeof(s_overwrite));
+  return 1;
+}
+
 int ZigbeeVibrationStore_LoadMetadata(uint32_t batch,void *data,uint16_t length)
 {
   if(!data || !length || length>ZIGBEE_BATCH_METADATA_MAX)return -1;
@@ -579,6 +629,7 @@ int ZigbeeVibrationStore_Acknowledge(uint32_t batch_id)
       }
       s_states[slot] = 2U;
       s_headers[slot].acknowledged = 0U;
+      if (s_upload_batch == batch_id) s_upload_batch = 0U;
       return 1;
     }
   }
@@ -632,7 +683,7 @@ HAL_StatusTypeDef ZigbeeVibrationStore_ResetRecords(void)
   }
   memset(s_headers, 0, sizeof(s_headers));
   memset(s_states, 0, sizeof(s_states));
-  memset(s_page_buffer, 0, sizeof(s_page_buffer));
+  memset(s_pages, 0, sizeof(s_pages));
   memset(&s_write_stats, 0, sizeof(s_write_stats));
   s_active_slot = s_next_slot = 0U;
   s_next_sequence = 1U;

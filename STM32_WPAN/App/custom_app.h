@@ -58,6 +58,9 @@ typedef struct
   int32_t vibration_features_milli[3][5];
   uint8_t valid_mask;
   uint8_t vibration_features_ready;
+  /* Consume the old two padding bytes; persisted snapshot size stays 80. */
+  uint8_t scalar_required_mask;
+  uint8_t scalar_policy_version;
 } Custom_APP_ZigbeeSnapshot_t;
 
 #define CUSTOM_APP_ZB_VALID_TEMPERATURE  0x01U
@@ -74,6 +77,11 @@ typedef struct
 
 /* Exported constants --------------------------------------------------------*/
 /* USER CODE BEGIN EC */
+typedef enum
+{
+  CUSTOM_APP_WORK_MODE_ONLINE = 0U,
+  CUSTOM_APP_WORK_MODE_INSPECTION = 1U
+} Custom_APP_WorkMode_t;
 
 /* USER CODE END EC */
 
@@ -91,8 +99,16 @@ typedef struct
 void Custom_APP_Init(void);
 void Custom_APP_Notification(Custom_App_ConnHandle_Not_evt_t *pNotification);
 /* USER CODE BEGIN EF */
+/* BLE policy only; these accessors do not change Zigbee or STOP2 policy. */
+Custom_APP_WorkMode_t Custom_APP_GetWorkMode(void);
+Custom_APP_WorkMode_t Custom_APP_GetConfiguredWorkMode(void);
 void Custom_APP_TxPoolAvailable(void);
 void Custom_APP_Process(void);
+void Custom_APP_ProtocolMtu(uint16_t handle, uint16_t mtu);
+uint8_t Custom_APP_ProtocolStreaming(void);
+/* 网关设置快照：5 个窗口 u32 + 抽取倍数 u16，小端，共 22 字节。 */
+void Custom_APP_ProtocolExportSettings(uint8_t out[22]);
+uint8_t Custom_APP_ProtocolImportSettings(const uint8_t in[22]);
 void Custom_APP_PrepareStop2(void);
 void Custom_APP_ResumeFromStop2(void);
 uint8_t Custom_APP_ZigbeeBeginSnapshot(uint16_t vibration_rate_hz,

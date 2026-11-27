@@ -710,6 +710,7 @@ typedef enum
   CFG_TASK_ZIGBEE_ADMISSION_WAKE,
   CFG_TASK_ZIGBEE_NVM_ERASE,
   CFG_TASK_ZIGBEE_SECURITY_DIAG,
+  CFG_TASK_BLE_BOND_SECURITY_ID,
 
   /* USER CODE END CFG_Task_Id_With_HCI_Cmd_t */
   CFG_LAST_TASK_ID_WITH_HCICMD,                                               /**< Shall be LAST in the list */
@@ -772,6 +773,8 @@ typedef enum
   CFG_LPM_APP_ZIGBEE,
   CFG_LPM_SECURITY_DIAG,
   CFG_LPM_MONITOR_STANDBY,
+  CFG_LPM_NVM_FLASH,
+  CFG_LPM_GATEWAY_EXCHANGE, /* 未得到网关明确许可、配置未保存时独立禁止 STOP2 */
   /* USER CODE END CFG_LPM_Id_t */
 } CFG_LPM_Id_t;
 

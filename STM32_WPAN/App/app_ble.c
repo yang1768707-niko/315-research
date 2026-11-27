@@ -37,6 +37,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+/* Keep Cube-generated defaults intact. This application has no display/keypad;
+   bond via Just Works and let CPU2 retain keys in its configured internal NVM. */
+#undef CFG_BONDING_MODE
+#define CFG_BONDING_MODE 1U
+#undef CFG_IO_CAPABILITY
+#define CFG_IO_CAPABILITY CFG_IO_CAPABILITY_NO_INPUT_NO_OUTPUT
 #include <stdio.h>
 #include <string.h>
 #include "hw_if.h"
@@ -246,6 +252,9 @@ uint8_t a_AdvData[10] =
 };
 
 /* USER CODE BEGIN PV */
+static uint16_t BondSecurityHandle = 0xFFFFU;
+static uint16_t BondRebondHandle = 0xFFFFU;
+static uint8_t BondReportPending;
 static uint8_t DleRetryTimerId;
 static uint8_t DleRetryCount;
 static uint8_t DleReady;
@@ -268,6 +277,7 @@ static void Connection_Interval_Update_Req(void);
 #endif /* L2CAP_REQUEST_NEW_CONN_PARAM != 0 */
 
 /* USER CODE BEGIN PFP */
+static void DT_BLE_BondSecurityTask(void);
 static void DT_BLE_DleRequestTask(void);
 static void DT_BLE_DleRetryTimerCallback(void);
 static void DT_BLE_StartAdvertisingTask(void);
@@ -401,6 +411,11 @@ void APP_BLE_Init(void)
   UTIL_SEQ_RegTask(1<<CFG_TASK_ADV_CANCEL_ID, UTIL_SEQ_RFU, Adv_Cancel);
 
   /* USER CODE BEGIN APP_BLE_Init_4 */
+  UTIL_SEQ_RegTask(1U << CFG_TASK_BLE_BOND_SECURITY_ID, UTIL_SEQ_RFU, DT_BLE_BondSecurityTask);
+  BondSecurityHandle = 0xFFFFU;
+  BondRebondHandle = 0xFFFFU;
+  BondReportPending = 1U;
+  UTIL_SEQ_SetTask(1U << CFG_TASK_BLE_BOND_SECURITY_ID, CFG_SCH_PRIO_0);
   DT_BLE_TimestampLog("BLE: CPU2 stack ready\r\n");
 #if (L2CAP_REQUEST_NEW_CONN_PARAM != 0)
   /* Use the shortest standard connection interval for high-rate streaming. */
@@ -548,6 +563,8 @@ SVCCTL_UserEvtFlowStatus_t SVCCTL_App_Notification(void *p_Pckt)
       HandleNotification.ConnectionHandle = BleApplicationContext.BleApplicationContext_legacy.connectionHandle;
       Custom_APP_Notification(&HandleNotification);
       /* USER CODE BEGIN EVT_DISCONN_COMPLETE */
+      BondSecurityHandle = 0xFFFFU;
+      BondRebondHandle = 0xFFFFU;
       {
         char dt_line[96];
         (void)snprintf(dt_line, sizeof(dt_line),
@@ -706,6 +723,9 @@ SVCCTL_UserEvtFlowStatus_t SVCCTL_App_Notification(void *p_Pckt)
           HandleNotification.ConnectionHandle = BleApplicationContext.BleApplicationContext_legacy.connectionHandle;
           Custom_APP_Notification(&HandleNotification);
           /* USER CODE BEGIN HCI_EVT_LE_CONN_COMPLETE */
+          BondSecurityHandle = p_connection_complete_event->Connection_Handle;
+          BondRebondHandle = 0xFFFFU;
+          UTIL_SEQ_SetTask(1U << CFG_TASK_BLE_BOND_SECURITY_ID, CFG_SCH_PRIO_0);
           if (AdvRetryTimerId != 0xFFU)
           {
             HW_TS_Stop(AdvRetryTimerId);
@@ -856,6 +876,17 @@ SVCCTL_UserEvtFlowStatus_t SVCCTL_App_Notification(void *p_Pckt)
           APP_DBG_MSG("\n");
 
           /* USER CODE BEGIN ACI_GAP_PAIRING_COMPLETE_VSEVT_CODE*/
+          {
+            char line[96];
+            (void)snprintf(line, sizeof(line), "BLE-BOND: pairing status=0x%02x reason=0x%02x\r\n",
+                           p_pairing_complete->Status, p_pairing_complete->Reason);
+            DT_BLE_TimestampLog(line);
+            if (p_pairing_complete->Status == 0U)
+            {
+              BondReportPending = 1U;
+              UTIL_SEQ_SetTask(1U << CFG_TASK_BLE_BOND_SECURITY_ID, CFG_SCH_PRIO_0);
+            }
+          }
 
           /* USER CODE END ACI_GAP_PAIRING_COMPLETE_VSEVT_CODE*/
           break;
@@ -881,6 +912,26 @@ SVCCTL_UserEvtFlowStatus_t SVCCTL_App_Notification(void *p_Pckt)
           break;
         }
         /* USER CODE BEGIN BLUE_EVT */
+        case ACI_GAP_BOND_LOST_VSEVT_CODE:
+        {
+          const aci_gap_bond_lost_event_rp0 *lost =
+              (const aci_gap_bond_lost_event_rp0 *)p_blecore_evt->data;
+          if (lost->Connection_Handle == BleApplicationContext.BleApplicationContext_legacy.connectionHandle)
+          {
+            BondRebondHandle = lost->Connection_Handle;
+            BondSecurityHandle = 0xFFFFU;
+            DT_BLE_TimestampLog("BLE-BOND: peer requests re-pairing after bond loss\r\n");
+            UTIL_SEQ_SetTask(1U << CFG_TASK_BLE_BOND_SECURITY_ID, CFG_SCH_PRIO_0);
+          }
+          break;
+        }
+        case ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE:
+        {
+          aci_att_exchange_mtu_resp_event_rp0 *mtu =
+              (aci_att_exchange_mtu_resp_event_rp0 *)p_blecore_evt->data;
+          Custom_APP_ProtocolMtu(mtu->Connection_Handle,mtu->Server_RX_MTU);
+          break;
+        }
 
         /* USER CODE END BLUE_EVT */
       }
@@ -1276,6 +1327,49 @@ const uint8_t* BleGetBdAddress(void)
 }
 
 /* USER CODE BEGIN FD_LOCAL_FUNCTION */
+static void DT_BLE_BondSecurityTask(void)
+{
+  if (BondRebondHandle != 0xFFFFU)
+  {
+    const uint16_t handle = BondRebondHandle;
+    char line[96];
+    BondRebondHandle = 0xFFFFU;
+    if (handle == BleApplicationContext.BleApplicationContext_legacy.connectionHandle)
+    {
+      /* Android may forget its bond in system Settings while this node keeps
+         the old key. Resume this peer's pairing, not a global database erase. */
+      const tBleStatus status = aci_gap_allow_rebond(handle);
+      (void)snprintf(line, sizeof(line), "BLE-BOND: allow re-pair handle=0x%04x status=0x%02x\r\n", handle, status);
+      DT_BLE_TimestampLog(line);
+    }
+  }
+  if (BondReportPending != 0U)
+  {
+    /* A vendor HCI response is at most 255 bytes: 36 seven-byte entries
+       safely cover its possible list length. Never print key/address data. */
+    Bonded_Device_Entry_t entries[36];
+    uint8_t count = 0U;
+    tBleStatus status = aci_gap_get_bonded_devices(&count, entries);
+    char line[104];
+    BondReportPending = 0U;
+    (void)snprintf(line, sizeof(line), "BLE-BOND: stored peers=%u query=0x%02x bonding=1\r\n", count, status);
+    DT_BLE_TimestampLog(line);
+  }
+  if (BondSecurityHandle != 0xFFFFU
+      && BondSecurityHandle == BleApplicationContext.BleApplicationContext_legacy.connectionHandle)
+  {
+    const uint16_t handle = BondSecurityHandle;
+    char line[104];
+    tBleStatus status;
+    BondSecurityHandle = 0xFFFFU;
+    /* Reuses an existing bond where available; first-time phones must pair.
+       Run HCI commands from the sequencer, not the CPU2 event callback. */
+    status = aci_gap_peripheral_security_req(handle);
+    (void)snprintf(line, sizeof(line), "BLE-BOND: security request handle=0x%04x status=0x%02x\r\n", handle, status);
+    DT_BLE_TimestampLog(line);
+  }
+}
+
 
 static void DT_BLE_StartAdvertisingTask(void)
 {
@@ -1307,10 +1401,21 @@ static void DT_BLE_StartAdvertisingTask(void)
     if (AdvRetryTimerId != 0xFFU)
     {
       HW_TS_Stop(AdvRetryTimerId);
-      AdvTimerAction = DT_ADV_TIMER_WINDOW;
-      HW_TS_Start(AdvRetryTimerId, FAST_ADV_TIMEOUT);
+      if (Custom_APP_GetWorkMode() == CUSTOM_APP_WORK_MODE_INSPECTION)
+      {
+        /* BLE-only mode policy: remain discoverable for inspection App reconnect.
+           Existing Zigbee arbitration and low-power lock code is unchanged. */
+        AdvTimerAction = DT_ADV_TIMER_IDLE;
+      }
+      else
+      {
+        AdvTimerAction = DT_ADV_TIMER_WINDOW;
+        HW_TS_Start(AdvRetryTimerId, FAST_ADV_TIMEOUT);
+      }
     }
-    DT_BLE_TimestampLog("BLE: advertising active for 30 s\r\n");
+    DT_BLE_TimestampLog((Custom_APP_GetWorkMode() == CUSTOM_APP_WORK_MODE_INSPECTION) ?
+        "BLE: inspection advertising active until connection\r\n" :
+        "BLE: advertising active for 30 s\r\n");
   }
   else if ((AdvRetryTimerId != 0xFFU) &&
            (AdvRetryCount < DT_ADV_MAX_RETRIES))

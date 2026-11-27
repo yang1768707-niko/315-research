@@ -38,7 +38,9 @@ extern "C" {
 enum
 {
   HW_OK     = 0,
-  HW_BUSY   = 1
+  HW_BUSY   = 1, /* arbitration unavailable; a multi-page erase may be partial */
+  HW_ERROR  = 2, /* HAL, notification, range or read-back failure */
+  HW_TIMEOUT = 3 /* HAL operation timed out */
 };
 
 /* Includes ------------------------------------------------------------------*/

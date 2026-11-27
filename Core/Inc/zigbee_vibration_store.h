@@ -13,6 +13,7 @@ typedef struct
   uint32_t pages;
   uint32_t partial_pages;
   uint32_t write_ms;
+  uint32_t erase_ms;
 } ZigbeeVibrationWriteStats_t;
 
 HAL_StatusTypeDef ZigbeeVibrationStore_Init(uint32_t *jedec_id,
@@ -33,6 +34,16 @@ void ZigbeeVibrationStore_GetWriteStats(ZigbeeVibrationWriteStats_t *stats);
 uint8_t ZigbeeVibrationStore_IsReady(void);
 
 int ZigbeeVibrationStore_Pending(uint8_t descriptor[V2_BATCH_LEN]);
+/* One upload context is retained across WAIT, sleep and final/features ACKs.
+ * Protect it before sending any request; batch=0 releases the RAM-only pin. */
+int ZigbeeVibrationStore_ProtectBatch(uint32_t batch);
+typedef struct {
+  uint32_t discarded_batch;
+  uint32_t replacement_batch;
+  unsigned slot;
+} ZigbeeVibrationOverwrite_t;
+/* Reports durable invalidation even if the following capture/erase fails. */
+int ZigbeeVibrationStore_TakeOverwrite(ZigbeeVibrationOverwrite_t *event);
 int ZigbeeVibrationStore_DescribeBatch(uint32_t batch, uint8_t descriptor[V2_BATCH_LEN]);
 int ZigbeeVibrationStore_SetRawPolicy(uint32_t batch, uint8_t upload);
 int ZigbeeVibrationStore_RawPolicy(uint32_t batch);

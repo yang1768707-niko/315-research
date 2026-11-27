@@ -9,6 +9,8 @@
 #define NOR_CMD_WRITE_STATUS  0x01U
 #define NOR_CMD_WRITE_ENABLE  0x06U
 #define NOR_CMD_READ          0x03U
+#define NOR_CMD_QUAD_READ     0x6BU
+#define NOR_QUAD_READ_DUMMY   8U
 #define NOR_CMD_PAGE_PROGRAM  0x02U
 #define NOR_CMD_QUAD_PAGE_PROGRAM 0x38U
 #define NOR_CMD_SECTOR_ERASE  0x20U
@@ -32,6 +34,26 @@ extern QSPI_HandleTypeDef hqspi;
 /* ISR callbacks only advance flags. Busy polling is started in task context. */
 static volatile uint8_t nor_async_state; /* 0 idle, 1 TX, 2 TX done, 3 WIP, 4 done, 5 error */
 static uint32_t nor_async_started;
+static QspiNor_ProgramTiming_t nor_timing;
+static uint32_t nor_setup_at, nor_tx_at, nor_poll_at, nor_prev_match_at;
+static volatile uint32_t nor_tx_done_at, nor_match_at;
+
+void QspiNor_ResetProgramTiming(void)
+{
+  memset(&nor_timing, 0, sizeof(nor_timing));
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  if ((DWT->CTRL & DWT_CTRL_NOCYCCNT_Msk) == 0U)
+  {
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U)
+      nor_timing.clock_hz = SystemCoreClock;
+  }
+}
+
+QspiNor_ProgramTiming_t QspiNor_GetProgramTiming(void)
+{
+  return nor_timing;
+}
 
 static HAL_StatusTypeDef QspiNor_ConfigureController(uint32_t prescaler,
                                                       uint32_t fifo_threshold)
@@ -316,10 +338,14 @@ HAL_StatusTypeDef QspiNor_Read(uint32_t address, uint8_t *data, uint32_t length)
     return HAL_ERROR;
   }
   QspiNor_CommandDefaults(&command);
-  command.Instruction = NOR_CMD_READ;
+  /* QE was verified during MX25R6435F initialization. Keep short metadata
+     reads and other parts on the original single-line path. */
+  uint8_t quad = (nor_quad_program != 0U) && (length >= 128U);
+  command.Instruction = quad ? NOR_CMD_QUAD_READ : NOR_CMD_READ;
   command.AddressMode = QSPI_ADDRESS_1_LINE;
   command.Address = address;
-  command.DataMode = QSPI_DATA_1_LINE;
+  command.DataMode = quad ? QSPI_DATA_4_LINES : QSPI_DATA_1_LINE;
+  command.DummyCycles = quad ? NOR_QUAD_READ_DUMMY : 0U;
   command.NbData = length;
   if (HAL_QSPI_Command(&hqspi, &command, NOR_TIMEOUT_MS) != HAL_OK)
   {
@@ -354,18 +380,33 @@ const char *QspiNor_GetLastErrorStage(void)
 {
   return nor_last_error_stage;
 }
+
+__weak void QspiNor_ProgramEvent(void)
+{
+}
  
  void HAL_QSPI_TxCpltCallback(QSPI_HandleTypeDef *handle)
  {
-   if (handle == &hqspi && nor_async_state == 1U) nor_async_state = 2U;
+   if (handle == &hqspi && nor_async_state == 1U) {
+     nor_tx_done_at = DWT->CYCCNT;
+     nor_async_state = 2U;
+     QspiNor_ProgramEvent();
+   }
  }
  void HAL_QSPI_StatusMatchCallback(QSPI_HandleTypeDef *handle)
  {
-   if (handle == &hqspi && nor_async_state == 3U) nor_async_state = 4U;
+   if (handle == &hqspi && nor_async_state == 3U) {
+     nor_match_at = DWT->CYCCNT;
+     nor_async_state = 4U;
+     QspiNor_ProgramEvent();
+   }
  }
  void HAL_QSPI_ErrorCallback(QSPI_HandleTypeDef *handle)
  {
-   if (handle == &hqspi && nor_async_state != 0U) nor_async_state = 5U;
+   if (handle == &hqspi && nor_async_state != 0U) {
+     nor_async_state = 5U;
+     QspiNor_ProgramEvent();
+   }
  }
  void QspiNor_ProgramAbort(void)
  {
@@ -384,6 +425,7 @@ const char *QspiNor_GetLastErrorStage(void)
        address >= nor_capacity_bytes || length > nor_capacity_bytes - address ||
        length > QSPI_NOR_PAGE_SIZE - address % QSPI_NOR_PAGE_SIZE || hqspi.hdma == NULL)
      return HAL_ERROR;
+   nor_setup_at = DWT->CYCCNT;
    if (QspiNor_WriteEnable() != HAL_OK) return HAL_ERROR;
    QspiNor_CommandDefaults(&command);
    command.Instruction = nor_quad_program ? NOR_CMD_QUAD_PAGE_PROGRAM : NOR_CMD_PAGE_PROGRAM;
@@ -393,6 +435,7 @@ const char *QspiNor_GetLastErrorStage(void)
    command.NbData = length;
    if (HAL_QSPI_Command(&hqspi, &command, 10U) != HAL_OK) return HAL_ERROR;
    nor_async_started = HAL_GetTick();
+   nor_tx_at = DWT->CYCCNT;
    nor_async_state = 1U;
    if (HAL_QSPI_Transmit_DMA(&hqspi, (uint8_t *)data) != HAL_OK) {
      nor_async_state = 5U;
@@ -416,11 +459,27 @@ const char *QspiNor_GetLastErrorStage(void)
      polling.StatusBytesSize = 1U;
      polling.Interval = 0x10U;
      polling.AutomaticStop = QSPI_AUTOMATIC_STOP_ENABLE;
+     nor_poll_at = DWT->CYCCNT;
      nor_async_state = 3U;
      if (HAL_QSPI_AutoPolling_IT(&hqspi, &command, &polling) != HAL_OK)
        nor_async_state = 5U;
    }
-   if (nor_async_state == 4U) { nor_async_state = 0U; return HAL_OK; }
+   if (nor_async_state == 4U) {
+     if (nor_timing.clock_hz != 0U) {
+       uint32_t gap = nor_setup_at - nor_prev_match_at;
+       if (nor_timing.pages != 0U && gap > nor_timing.max_gap_cycles)
+         nor_timing.max_gap_cycles = gap;
+       nor_timing.pages++;
+       nor_timing.setup_cycles += nor_tx_at - nor_setup_at;
+       nor_timing.tx_cycles += nor_tx_done_at - nor_tx_at;
+       nor_timing.poll_start_delay_cycles += nor_poll_at - nor_tx_done_at;
+       nor_timing.poll_cycles += nor_match_at - nor_poll_at;
+       nor_timing.completion_delay_cycles += DWT->CYCCNT - nor_match_at;
+       nor_prev_match_at = nor_match_at;
+     }
+     nor_async_state = 0U;
+     return HAL_OK;
+   }
    if (nor_async_state == 5U ||
        (nor_async_state != 0U && HAL_GetTick() - nor_async_started > 50U)) {
      nor_last_error_stage = "async-page-timeout/error";
