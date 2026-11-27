@@ -36,3 +36,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-comm-tests.ps1 -Lc
 ```
 
 主机测试覆盖协议、采集控制、工作模式、延迟重启、绑定任务及网关交互。无线吞吐、真实配对、断电保持和传感器数据完整性需要实机验证。
+
+
+蓝牙专家：刘子锐
