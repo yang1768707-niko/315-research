@@ -18,24 +18,34 @@ STM32WB55RGV6 BLE / Zigbee 节点固件，使用 STM32CubeIDE 工程。仓库根
 
 仓库包含 Core、STM32_WPAN、Drivers、Middlewares、Utilities、CubeIDE 配置、链接脚本和依赖静态库。Debug、Release、工作区元数据及编译产物由 `.gitignore` 排除，克隆后由本机构建生成。
 
-## 通信与功能说明
+## 当前分支：BLE / QSPI 融合版本
 
-- [统一通信协议及配置 App 适配要求](COMM_PROTOCOL.md)
+本次从已测试的原节点工程同步源码。保留现用 Zigbee 活跃接收、通信测试、外设休眠、RTC 长时间休眠和网关配置交互；合入 Git 版本的 BLE 绑定、工作模式和延迟复位处理。QSPI 使用统一四线数据读取、双缓冲页写入、完成事件调度，保留深度掉电与唤醒检查。
+
+- [相对旧 Git 的修改对照、融合范围与测试步骤](MERGE_BLE_QSPI_20261127.md)
+- [下载后旧采集记录处理](DOWNLOAD_FLASH_CLEAR.md)
+- [外部 Flash 缓存策略](FLASH_CACHE_POLICY.md)
 - [BLE 工作模式、绑定与自动重启](BLE_WORK_MODE.md)
-- [网关交互与配置保存](GATEWAY_EXCHANGE.md)
 
-BLE 和 Zigbee 采集命令最终响应均为 16 字节，统一工作模式命令响应为 15 字节，模式事件及 FE82 快照为 11 字节。App 与网关修改时请同步核对协议字段、结果码、请求序号和配置版本。
+BLE 采集命令最终响应为 16 字节，工作模式响应为 15 字节，模式事件及 FE82 快照为 11 字节。Zigbee 保留现用网关协议，以 `Core/Inc/gateway_exchange_wire.h`、`control_sync.h` 和 `STM32_WPAN/App/app_zigbee.c` 为准。协调器与网关继续使用配套现用版本。
+
+`COMM_PROTOCOL.md` 和 `GATEWAY_EXCHANGE.md` 保留导入 Git 版本的设计记录，其中通用 Zigbee 命令入口与本次保留的 Zigbee 实现不同，不能据此要求现用网关改为旧设计。
+
+在 CubeIDE 中使用 `BLE-QSPI 本地融合测试` 下载配置，它指向本工程的 Debug ELF，未设置全片擦除命令。串口为 921600、8N1。克隆后需在自己的电脑上构建，`Debug` 等产物不提交到仓库；同名工程在一个 IDE workspace 中只导入一份。
 
 ## 主机回归
 
-模式与绑定测试通过实际源码抽取运行，使用宿主 GCC 时可设置 `NATIVE_CC`。采集和网关回归脚本可通过 `-LccRoot` 指定本机 LCC64 目录。
+以下测试编译实际源码或从中抽取函数，不访问硬件。安装宿主 GCC 并加入 PATH 后运行：
 
 ```powershell
 node tests/run-ble-work-mode-tests.cjs
-powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-comm-tests.ps1 -LccRoot "<本机 LCC64 目录>"
+node tests/run-qspi-store-tests.cjs
 ```
 
-主机测试覆盖协议、采集控制、工作模式、延迟重启、绑定任务及网关交互。无线吞吐、真实配对、断电保持和传感器数据完整性需要实机验证。
+也可用 `NATIVE_CC` 指定宿主 GCC 可执行文件。若使用 Zig，将 `NATIVE_CC` 指向 `zig.exe`，并设置 `NATIVE_CC_ARGS='["cc"]'`。BLE 模式测试另保留 LCC64 支持，可用 `LCC_ROOT` 指定目录。
 
+QSPI 模拟覆盖短/长四线读取、QE 失败、并发忙保护、掉电超时重试、DMA 页缓冲所有权、三种完整采集长度的写入/CRC/重新加载，以及 STOP2 准备失败的拒绝和重试。BLE 模式测试覆盖保存/发送失败、断线、延迟复位和绑定任务。
+
+保留的旧 `tests/run-comm-tests.ps1`、`test_comm_protocol.c`、`mock_comm_acquisition.c`、`test_gateway_exchange.c` 针对导入 Git 版本的通用 Zigbee 入口，不能作为本分支当前 Zigbee 实现的验收测试。无线吞吐、真实配对、RTC 唤醒和功耗仍需实机验证。
 
 蓝牙专家：刘子锐

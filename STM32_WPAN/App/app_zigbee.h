@@ -44,14 +44,6 @@ typedef enum {
 /* Exported constants --------------------------------------------------------*/
 
 /* Exported functions ------------------------------------------------------- */
-#include "comm_protocol.h"
-#include "custom_app.h"
-uint8_t APP_ZIGBEE_ProtocolReady(void);
-void APP_ZIGBEE_GatewayProcess(void);
-uint8_t APP_ZIGBEE_WaitingGateway(void);
-uint32_t APP_ZIGBEE_ProtocolNextBatch(void);
-CommResult APP_ZIGBEE_ProtocolSubmit(uint32_t batch, const Custom_APP_ZigbeeSnapshot_t *snapshot);
-CommResult APP_ZIGBEE_ProtocolSend(const CommSource *source,const uint8_t *frame,uint16_t length);
 void APP_ZIGBEE_Init(void);
 void APP_ZIGBEE_Error(uint32_t ErrId, uint32_t ErrCode);
 void APP_ZIGBEE_RegisterCmdBuffer(TL_CmdPacket_t *p_buffer);
@@ -60,10 +52,12 @@ void Pre_ZigbeeCmdProcessing(void);
 void APP_ZIGBEE_Stop(void);
 uint8_t APP_ZIGBEE_IsConnected(void);
 uint8_t APP_ZIGBEE_IsPendingAuthorization(void);
+void APP_ZIGBEE_CommTest(void); /* Diagnostic only; call from task context. */
 uint8_t APP_ZIGBEE_IsAdmissionSleeping(void);
 uint8_t APP_ZIGBEE_IsMeasuring(void);
 uint8_t APP_ZIGBEE_IsTransmitting(void);
 void APP_ZIGBEE_SetBleConnected(uint8_t connected);
+void APP_ZIGBEE_SetBleRadioIdle(uint8_t idle);
 void APP_ZIGBEE_SetCommissioningWindow(uint8_t open);
 extern uint8_t g_ot_notification_allowed;
 

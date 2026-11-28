@@ -83,8 +83,8 @@ static void ZbApp_UpdateClusterSnapshot(const Custom_APP_ZigbeeSnapshot_t *s,uin
 static volatile uint8_t hy_parent_response;
 static void ZbApp_ParentDescriptor(struct ZbZdoNodeDescRspT *rsp,void *arg)
 {
-  hy_zdo_inflight=0U;
   if((uint32_t)(uintptr_t)arg!=command_confirm_generation || !ZbApp.parent_sync_pending) return;
+  hy_zdo_inflight=0U;
   hy_parent_response=(rsp && rsp->status==ZB_STATUS_SUCCESS && rsp->nwkAddr==0U)?1U:2U;
   UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_0);
 }

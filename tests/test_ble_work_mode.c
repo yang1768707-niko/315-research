@@ -93,12 +93,12 @@ static uint16_t packet(uint8_t *frame,uint8_t code,uint16_t sequence,uint8_t mod
  return Comm_EncodeFrame(frame,COMM_COMMAND_MAX,COMM_KIND_COMMAND,code,sequence,&mode,code==COMM_CMD_WORK_MODE_QUERY?0:1);
 }
 int main(void){
- CommSource ble={COMM_LINK_BLE,10},zb={COMM_LINK_ZIGBEE,20};
+ CommSource ble={COMM_LINK_BLE,10};
  uint8_t frame[COMM_COMMAND_MAX];uint16_t n;unsigned before;
  backup=0;DT_LoadWorkMode();assert(Custom_APP_GetWorkMode()==0&&Custom_APP_GetConfiguredWorkMode()==0);
  Comm_Init(NULL);Comm_RegisterWorkModeHandler(DT_CommWorkMode);
- Comm_RegisterTransport(COMM_LINK_BLE,transport);Comm_RegisterTransport(COMM_LINK_ZIGBEE,transport);
- Comm_SetSession(ble.link,ble.session);Comm_SetSession(zb.link,zb.session);
+ Comm_RegisterTransport(COMM_LINK_BLE,transport);
+ Comm_SetSession(ble.link,ble.session);
  Custom_App_Context.IsConnected=1;Custom_App_Context.Sensor_status_Notification_Status=1;Custom_App_Context.TxFlowOn=0x33;
  /* A new subscription defaults to the 11-byte common event. */
  DT_QueueWorkModeStatus();DT_ProcessWorkMode(0);
@@ -131,25 +131,25 @@ int main(void){
  DT_ProcessWorkMode(50);assert(read_bytes[2]==COMM_DATA_WORK_MODE&&read_bytes[10]==1);
  assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();assert(save_count==before+1);
  frame[8]=0;assert(Comm_Receive(&ble,frame,n)==COMM_BAD_VALUE);
- /* Query from Zigbee uses identical payload and returns over Zigbee. */
- n=packet(frame,COMM_CMD_WORK_MODE_QUERY,1,0);assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();
- assert(last_source.link==COMM_LINK_ZIGBEE&&notify_bytes[9]==0&&notify_bytes[10]==1);
- /* SET from Zigbee also saves without changing current BLE advertising policy. */
- n=packet(frame,COMM_CMD_WORK_MODE_SET,2,0);assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();
- assert(last_source.link==COMM_LINK_ZIGBEE&&notify_bytes[10]==0&&backup==0x57423500U);
- n=packet(frame,COMM_CMD_WORK_MODE_SET,3,1);fail_save=1;assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();
+ /* Queries use the BLE response transport and current mode snapshot. */
+ n=packet(frame,COMM_CMD_WORK_MODE_QUERY,1,0);assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();
+ assert(last_source.link==COMM_LINK_BLE&&notify_bytes[9]==0&&notify_bytes[10]==1);
+ /* SET saves without changing the active advertising policy before reset. */
+ n=packet(frame,COMM_CMD_WORK_MODE_SET,2,0);assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();
+ assert(last_source.link==COMM_LINK_BLE&&notify_bytes[10]==0&&backup==0x57423500U);
+ n=packet(frame,COMM_CMD_WORK_MODE_SET,3,1);fail_save=1;assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();
  assert(notify_bytes[8]==COMM_SAVE_FAILED&&notify_bytes[10]==0);fail_save=0;
  /* Invalid values and lengths respond without invoking the persistence handler. */
  before=save_count;n=packet(frame,COMM_CMD_WORK_MODE_SET,4,2);
- assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();
+ assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();
  assert(save_count==before&&notify_bytes[8]==COMM_BAD_VALUE&&notify_bytes[9]==COMM_WORK_MODE_UNKNOWN&&notify_bytes[10]==COMM_WORK_MODE_UNKNOWN);
  n=Comm_EncodeFrame(frame,sizeof(frame),COMM_KIND_COMMAND,COMM_CMD_WORK_MODE_SET,5,NULL,0);
- assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();assert(notify_bytes[8]==COMM_BAD_LENGTH&&save_count==before);
+ assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();assert(notify_bytes[8]==COMM_BAD_LENGTH&&save_count==before);
  n=packet(frame,COMM_CMD_WORK_MODE_SET,6,0);frame[2]=COMM_CMD_WORK_MODE_QUERY;
- assert(Comm_Receive(&zb,frame,n)==COMM_OK);Comm_Process();assert(notify_bytes[8]==COMM_BAD_LENGTH);
+ assert(Comm_Receive(&ble,frame,n)==COMM_OK);Comm_Process();assert(notify_bytes[8]==COMM_BAD_LENGTH);
  /* Different queued settings must each preserve their own execution snapshot. */
- n=packet(frame,COMM_CMD_WORK_MODE_SET,7,1);assert(Comm_Receive(&zb,frame,n)==COMM_OK);
- n=packet(frame,COMM_CMD_WORK_MODE_SET,8,0);assert(Comm_Receive(&zb,frame,n)==COMM_OK);
+ n=packet(frame,COMM_CMD_WORK_MODE_SET,7,1);assert(Comm_Receive(&ble,frame,n)==COMM_OK);
+ n=packet(frame,COMM_CMD_WORK_MODE_SET,8,0);assert(Comm_Receive(&ble,frame,n)==COMM_OK);
  fail_gatt=1;Comm_Process();fail_gatt=0;Comm_Process();assert(notify_bytes[10]==1);Comm_Process();assert(notify_bytes[10]==0);
  /* Disconnect invalidates queued SET; the next connection cannot execute it. */
  before=save_count;n=packet(frame,COMM_CMD_WORK_MODE_SET,50,1);assert(Comm_Receive(&ble,frame,n)==COMM_OK);
@@ -217,9 +217,6 @@ int main(void){
  tick=deadline-1;DT_ProcessWorkMode(tick);assert(resets==1);
  tick=deadline;DT_ProcessWorkMode(tick);assert(resets==2);
  DT_LoadWorkMode();
- /* Zigbee mode changes keep their existing configuration workflow. */
- request.source=zb;request.mode=1;assert(DT_CommWorkMode(&request,&active,&configured)==COMM_OK);
- assert(!DT_ModeRestartPending&&!DT_ModeRestartScheduled);
  /* Production bonding task ignores stale handles and consumes each event. */
  BleApplicationContext.BleApplicationContext_legacy.connectionHandle=0x801;
  BondReportPending=1;BondSecurityHandle=0x801;

@@ -9,8 +9,6 @@
 #include "app_conf.h"
 #include "app_entry.h"
 #include "app_zigbee.h"
-#include "comm_protocol.h"
-#include "gateway_exchange.h"
 #include "custom_app.h"
 #include "sensor_clusters.h"
 #include "../../Middlewares/Sensors/Thermometer/thermometer.h"
@@ -24,9 +22,13 @@
 #include "vibration_tx.h"
 #include "scalar_tx.h"
 #include "upload_lease.h"
+#include "upload_completion.h"
 #include "link_health.h"
+_Static_assert(ZB_WPAN_STATUS_NO_ACK==0xe9 && ZB_APS_STATUS_NO_ACK==0xa7,
+               "Peer ACK health status values must match the Zigbee SDK");
 #include "sampling_cadence.h"
 #include "node_wake_plan.h"
+#include "gateway_exchange_wire.h"
 #include "vibration_features.h"
 #include "zigbee_vibration_store.h"
 
@@ -39,9 +41,23 @@ static uint8_t hy_zdo_inflight;
 static uint8_t recovery_token[8];
 static uint8_t recovery_token_valid;
 static uint8_t recovery_config_pending;
+static uint8_t post_upload_config_due;
+static struct {
+  uint32_t token,batch,revision,probe_at;
+  uint16_t decision,command_seq;
+  uint8_t active,advertised,commands,permit,rejected,save_error,scalar;
+  uint8_t sleep_persist_requested;
+  uint8_t command[GX_SAMPLING_SIZE],command_result,final_valid;
+  Custom_APP_ZigbeeSnapshot_t snapshot;
+} gateway_exchange;
+static void ZbApp_BeginGatewayExchange(uint32_t batch,const Custom_APP_ZigbeeSnapshot_t *snapshot);
+static void ZbApp_CloseGatewayExchange(void);
+static void ZbApp_ServiceGatewayExchange(void);
+static void ZbApp_CompleteGatewayCommand(uint8_t result);
 static uint8_t recovery_announce_pending;
 static uint8_t recovery_retry_count;
 static SamplingCadence sampling_cadence;
+static uint8_t sampling_resume_pending;
 static uint8_t sampling_timer = 0xFFU;
 static volatile uint8_t sampling_due;
 static void ZbApp_SamplingTimerCallback(void);
@@ -65,25 +81,6 @@ static uint8_t leave_cleanup_pending;
 #include "zigbee.zdo.h"
 
 #define ZB_APP_ENDPOINT                    1U
-/* 网关许可独立于原上传/配置计时器，任何旧超时路径都不能释放此锁。 */
-static GatewayExchange gateway_exchange;
-static uint8_t gateway_settings_dirty, gateway_mode_save_failed;
-static uint8_t gateway_loaded_valid,gateway_loaded_enabled;
-static uint8_t gateway_legacy_reply_pending; /* 1待保存，2成功待发，3保存失败待发 */
-static uint32_t gateway_save_retry;
-static struct nwk_fastpoll_entry_t *gateway_fast_poll;
-static Custom_APP_ZigbeeSnapshot_t gateway_scalar_cache;
-static uint8_t gateway_scalar_cache_valid;
-extern RTC_HandleTypeDef hrtc;
-static void ZbApp_GatewayBegin(uint32_t batch);
-static void ZbApp_GatewayChanged(void);
-static void ZbApp_CommonCommandDone(const CommRequest *request,CommResult result);
-static CommResult ZbApp_FinalizeCommand(const CommRequest *request,CommResult result,uint32_t *revision);
-static void ZbApp_FinalResponseSubmitted(const CommRequest *request,CommResult result,uint32_t revision);
-static void ZbApp_GatewaySaveSettings(void);
-static void ZbApp_GatewayLoadSettings(void);
-
-static uint8_t protocol_peer_enabled;
 static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
 #define ZB_ALL_CHANNELS_MASK               0x07FFF800UL
 #define ZB_JOIN_RETRY_MS                   5000U
@@ -95,6 +92,7 @@ static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
 #define ZB_SAVED_NETWORK_BUDGET_MS         15000U
 #define ZB_RESTORED_PARENT_VERIFY_MS       10000U
 #define ZB_FRESH_ADMISSION_BUDGET_MS       30000U
+#define ZB_FRESH_JOIN_COMPLETION_GRACE_MS  15000U
 #define ZB_UNAPPROVED_WAKE_DELAY_MS        300000U
 #define ZB_AUDIO_SETTLE_MS                 800U
 #define ZB_CONFIG_QUERY_JOIN               0x01U
@@ -105,7 +103,6 @@ static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
 #define ZB_CONFIG_QUERY_RETRY_MS            2000U
 #define ZB_CONFIG_QUERY_MAX_ATTEMPTS        3U
 #define ZB_CONFIG_FLAG_CHANNEL_MIGRATION    0x01U
-#define ZB_COMMISSIONING_FAST_POLL_MS       3000U
 /* CPU2 FW 1.23.0 has blocked when persistence was exported directly inside
  * the join callback. Export later from the sequencer after radio traffic is
  * idle; pending nodes use a short delay while authorized nodes retain the
@@ -128,6 +125,7 @@ static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
 #define ZB_CMD_REPORT_START                0x08U
 #define ZB_CMD_REPORT_STOP                 0x09U
 #define ZB_CMD_MONITOR_CONTROL             0x0BU
+#define ZB_MONITOR_OP_AUTHORIZE            0x03U
 #define ZB_CMD_MONITOR_CONFIG              0x0CU
 #define ZB_CMD_TEMP_REPORT                 0x86U
 #define ZB_CMD_MAG_REPORT                  0x87U
@@ -144,7 +142,7 @@ static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
 #define ZB_MONITOR_COMPLETE                0x04U
 #define ZB_MONITOR_ERROR                   0x05U
 #define ZB_TX_QUEUE_DEPTH                  16U
-#define ZB_TX_MAX_PAYLOAD                  COMM_ZB_FRAME_MAX
+#define ZB_TX_MAX_PAYLOAD                  70U
 #define ZB_TX_MAX_IN_FLIGHT                 3U
 /* Temporary config-query observation build. Set to 0 to silence diagnostics. */
 #ifndef ZB_CONFIG_TX_DIAG_ENABLED
@@ -157,6 +155,33 @@ static uint8_t coordinator_endpoint; /* learned by HY v3 HELLO */
    (1U << CFG_TASK_ZIGBEE_ANNOUNCE) |      \
    (1U << CFG_TASK_ZIGBEE_PERSIST) |       \
    (1U << CFG_TASK_ZIGBEE_UPLOAD))
+
+#define ZB_SLEEP_EXTRA_TASKS \
+  ((1U << CFG_TASK_ZIGBEE_ADMISSION_WAKE) | \
+   (1U << CFG_TASK_ZIGBEE_NVM_ERASE) | \
+   (1U << CFG_TASK_ZIGBEE_SECURITY_DIAG) | \
+   (1U << CFG_TASK_ZIGBEE_COMM_TEST))
+#define ZB_SLEEP_RADIO_RETRY_MS 100U
+
+typedef enum
+{
+  ZB_RADIO_SLEEP_NONE,
+  ZB_RADIO_SLEEP_ADMISSION,
+  ZB_RADIO_SLEEP_QUEUE,
+  ZB_RADIO_SLEEP_SAMPLING,
+  ZB_RADIO_SLEEP_STANDBY
+} ZbRadioSleepReason;
+
+static struct
+{
+  volatile ZbRadioSleepReason reason;
+  uint8_t held;
+  uint8_t pause_pending;
+  uint8_t paused;
+  uint8_t retry_timer;
+  uint8_t ble_idle;
+  uint8_t ble_resume_due;
+} radio_sleep = {.retry_timer = 0xFFU};
 
 typedef struct
 {
@@ -172,6 +197,9 @@ typedef struct
   uint32_t raw_upload_generation;
   uint8_t sensor_enable_mask;
 } ZbMonitorConfig_t;
+
+#define ZB_DEFAULT_SAMPLING_CONFIG {300U, 5U, 26667U, 46875U, 256000U, \
+    500U, 1000U, 1000U, 1U, 1U, CUSTOM_APP_ZB_SENSOR_ALL}
 
 typedef struct
 {
@@ -275,7 +303,7 @@ struct ZbStartupWaitInfo
 static struct ZbStartupWaitInfo startup_wait_info;
 static uint32_t startup_wait_generation;
 /* Accepted startup/rejoin remains live on CPU2 after an application timeout. */
-static uint8_t startup_operation_inflight;
+static volatile uint8_t startup_operation_inflight;
 static uint8_t startup_drain_phase;
 static uint32_t persist_restore_generation;
 /* Actual CPU2 operation lifetime, separate from application callback validity. */
@@ -293,7 +321,7 @@ static MonitorStandby monitor_standby;
 static uint32_t applied_config_hash;
 static uint8_t network_persist_format_v2;
 static volatile uint8_t admission_expired;
-static struct nwk_fastpoll_entry_t *ZbAdmissionFastPoll;
+static volatile uint8_t fresh_join_grace_active;
 
 extern UART_HandleTypeDef huart1;
 extern RNG_HandleTypeDef hrng;
@@ -307,8 +335,7 @@ static void ZbApp_AdmissionWakeTask(void);
 static void ZbApp_StartAdmissionBudget(uint8_t phase);
 static void ZbApp_CheckAuthorizationBudget(void);
 static void ZbApp_ScheduleMonitorStandby(void);
-static void ZbApp_ReleaseMonitorStandbyLock(void);
-static enum ZclStatusCodeT ZbApp_SendLinkStatus(uint8_t applied);
+static void ZbApp_SendLinkStatus(uint8_t applied);
 static uint8_t ZbApp_ServiceControlWindow(void);
 static uint8_t ZbApp_ApplyMonitorSwitch(uint8_t flags);
 static void ZbApp_EnterAdmissionSleep(void);
@@ -323,6 +350,10 @@ static void ZbApp_TxTask(void);
 static void ZbApp_UploadTask(void);
 static void ZbApp_RadioControlTask(void);
 static void ZbApp_RadioPausedCallback(void *arg);
+static void ZbApp_SleepRadioRetryCallback(void);
+static void ZbApp_RequestRadioSleep(ZbRadioSleepReason reason);
+static void ZbApp_WakeSleepRadio(void);
+static void ZbApp_FinishRadioSleep(void);
 static void ZbApp_AnnounceTask(void);
 static void ZbApp_JoinRetryTimerCallback(void);
 static void ZbApp_ReportTimerCallback(void);
@@ -340,6 +371,10 @@ static void ZbApp_StartFreshJoinFallback(void);
 static void ZbApp_CompleteJoinFailureCycle(void);
 static void ZbApp_StartAutonomousReporting(void);
 static void ZbApp_ScheduleNextReport(void);
+static void ZbApp_RequireSamplingSchedule(void);
+static void ZbApp_ResumeCachedUpload(void);
+static uint8_t ZbApp_ApplySamplingDeadline(uint32_t epoch,uint32_t delay);
+static uint8_t ZbApp_WaitForSamplingDeadline(uint8_t sampling_wake);
 static void ZbApp_SendSnapshot(const Custom_APP_ZigbeeSnapshot_t *snapshot,
                                uint32_t batch_id);
 static unsigned ZbApp_ScalarPacket(const Custom_APP_ZigbeeSnapshot_t *snapshot,
@@ -375,13 +410,14 @@ static int ZbApp_UploadRead(void *context, uint32_t batch, uint32_t first,
 static int ZbApp_UploadSend(void *context, uint8_t command,
                             const uint8_t *data, size_t length);
 static void ZbApp_UploadConfirm(struct ZbApsdeDataConfT *confirm, void *arg);
-static void ZbApp_StartUploadFastPoll(void);
-static void ZbApp_StopUploadFastPoll(void);
-static void ZbApp_StartAdmissionFastPoll(void);
-static void ZbApp_StopAdmissionFastPoll(void);
 
 static bool ZbApp_NvmInit(void);
 static bool ZbApp_NvmRead(void);
+static void ZbApp_LoadLocalSampling(void);
+static ZbMonitorConfig_t ZbApp_DecodeSampling(const uint8_t *payload, uint16_t length);
+static bool ZbApp_SaveLocalSampling(const ZbMonitorConfig_t *config);
+static uint32_t sampling_nvm_revision;
+static uint32_t sampling_nvm_hash;
 #if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
 static bool ZbApp_NvmWrite(void);
 static bool ZbApp_NvmWriteAuthorization(void);
@@ -391,8 +427,9 @@ static void ZbApp_NvmErase(void);
 static bool ZbApp_PersistSave(void);
 static void ZbApp_PersistTask(void);
 static void ZbApp_PersistNotify(struct ZigBeeT *zb, void *arg);
-static void ZbApp_EnablePersistence(void);
-static void ZbApp_SchedulePersistSave(uint32_t delay_ms);
+static void ZbApp_EnablePersistence(const char *source);
+static void ZbApp_SchedulePersistSave(uint32_t delay_ms, const char *source);
+static void ZbApp_RecordPersistRequest(const char *source, uint32_t delay_ms);
 #endif
 static enum ZbStatusCodeT ZbApp_StartPersistedNetwork(void);
 static void ZbApp_PersistRestoreCallback(enum ZbStatusCodeT status, void *arg);
@@ -418,9 +455,7 @@ PLACE_IN_SECTION("MB_MEM2") ALIGN(4) static uint8_t ZigbeeNotifRequestBuffer[siz
 
 static ZbAppContext_t ZbApp = {
   .join_status = (enum ZbStatusCodeT)0x01,
-  .monitor_config = {300U, 5U, 26667U, 46875U, 256000U,
-                     500U, 1000U, 1000U, 1U, 0U,
-                     CUSTOM_APP_ZB_SENSOR_ALL},
+  .monitor_config = ZB_DEFAULT_SAMPLING_CONFIG,
   .join_retry_timer = 0xFFU,
   .report_timer = 0xFFU,
   .persist_timer = 0xFFU,
@@ -443,17 +478,52 @@ static struct {
   ScalarTx scalars;
 } ZbDeferred;
 static ZbUploadRadioSlot_t ZbUploadSlots[3U];
-static struct nwk_fastpoll_entry_t *ZbUploadFastPoll;
-static struct nwk_fastpoll_entry_t *ZbConfigFastPoll;
 static LinkHealth upload_health;
 static UploadLease upload_lease;
 static uint32_t upload_generation,upload_nonce;
+#include "node_upload_trace.h"
 static uint8_t ZbApp_ServiceUploadRecovery(void);
 
 static void ZbApp_ClearDeferredUpload(void)
 {
   (void)ZigbeeVibrationStore_ProtectBatch(0U);
   memset(&ZbDeferred, 0, sizeof(ZbDeferred));
+}
+
+static int ZbApp_AcceptCompletedBatch(const uint8_t *payload,size_t length)
+{
+  if(!ZbDeferred.active || ZbDeferred.confirmed ||
+     !upload_completion_matches(payload,length,ZbVibrationUpload.batch,
+       ZbDeferred.scalars.manifest,!ZbDeferred.feature_only,&upload_lease,
+       ZbVibrationUpload.phase==V2_TX_BATCH))return 0;
+  /* This authenticated, identity-bound receipt is stronger than a late APS
+   * failure/expired lease. Stop transmitting; acknowledge Flash in task context. */
+  ZbDeferred.confirmed=1U;
+  ZbVibrationUpload.phase=V2_TX_IDLE;
+  ZbVibrationUpload.deferred=0;
+  upload_generation++;
+  memset(&upload_health,0,sizeof(upload_health));
+  memset(&upload_lease,0,sizeof(upload_lease));
+  ZbApp_Log("ZIGBEE: gateway confirms batch=%lu already complete; releasing retained Flash record\r\n",
+            (unsigned long)ZbDeferred.batch);
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
+  return 1;
+}
+
+static int ZbApp_ReleaseConfirmedBatch(void)
+{
+  if(!ZbDeferred.active || !ZbDeferred.confirmed)return 0;
+  if(!ZigbeeVibrationStore_Acknowledge(ZbDeferred.batch))return -1;
+  ZbApp_Log("ZIGBEE: batch=%lu raw/features confirmed; Flash record released\r\n",
+            (unsigned long)ZbDeferred.batch);
+  upload_generation++;
+  memset(&upload_lease,0,sizeof(upload_lease));
+  memset(&upload_health,0,sizeof(upload_health));
+  ZbUploadQueueSleeping=0U;
+  ZbUploadQueueWake=0U;
+  ZbApp_ClearDeferredUpload();
+  ZbVibrationUpload.phase=V2_TX_IDLE;
+  return 1;
 }
 
 /* Metadata only. Copy in the CPU2 callback, print/read attributes in a task.
@@ -500,11 +570,17 @@ static void ZbApp_Log(const char *format, ...)
                           (uint16_t)(prefix_len + length), 300U);
 }
 
+static enum ZbStatusCodeT ZbApp_SendPendingLinkFrame(uint8_t command,
+    const uint8_t *payload, uint8_t length,
+    void (*confirm)(struct ZbApsdeDataConfT *, void *), void *arg);
+
+#include "node_comm_test.h"
+
 /* Observation only: no extra stack requests, callbacks, timers or retries. */
 static void ZbApp_ConfigDiag(const char *stage, uint8_t reason, unsigned int result)
 {
 #if (ZB_CONFIG_TX_DIAG_ENABLED != 0U)
-  ZbApp_Log("ZIGBEE-CFG: %s r=%02x n=%u rc=%02x ep=%u cl=%u%u%u q=%u fly=%u p=%u join=%02x hold=%u ex=%u pause=%u/%u rec=%u ann=%u fp=%u\r\n",
+  ZbApp_Log("ZIGBEE-CFG: %s r=%02x n=%u rc=%02x ep=%u cl=%u%u%u q=%u fly=%u p=%u join=%02x hold=%u ex=%u pause=%u/%u rec=%u ann=%u\r\n",
             stage, (unsigned int)reason, (unsigned int)ZbApp.config_query_attempts,
             result, (unsigned int)coordinator_endpoint,
             ZbApp.control_server != NULL, ZbApp.data_server != NULL, ZbApp.temperature_server != NULL,
@@ -513,7 +589,7 @@ static void ZbApp_ConfigDiag(const char *stage, uint8_t reason, unsigned int res
             (unsigned int)ZbApp.persist_tx_hold, (unsigned int)ZbApp.radio_exclusive,
             (unsigned int)ZbApp.radio_paused, (unsigned int)ZbApp.radio_pause_pending,
             (unsigned int)(ZbApp.restore_pending || ZbApp.restore_recovery_active),
-            (unsigned int)recovery_announce_pending, ZbConfigFastPoll != NULL);
+            (unsigned int)recovery_announce_pending);
 #else
   UNUSED(stage); UNUSED(reason); UNUSED(result);
 #endif
@@ -543,15 +619,11 @@ static void ZbApp_ConfigDiagQueued(const char *stage, unsigned int result)
 
 void APP_ZIGBEE_Init(void)
 {
-  Comm_RegisterTransport(COMM_LINK_ZIGBEE,APP_ZIGBEE_ProtocolSend);
-  Comm_RegisterExecutedObserver(ZbApp_CommonCommandDone);
-  Comm_RegisterCommandFinalizer(ZbApp_FinalizeCommand,ZbApp_FinalResponseSubmitted);
-  ZbApp_GatewayLoadSettings();
   SHCI_CmdStatus_t status;
   uint32_t random_batch_seed;
 
   ZbApp_Log("ZIGBEE: phase2 node initialization start\r\n");
-  ZbApp_Log("ZIGBEE: build ble-zigbee-logical-reset-20261027 | %s %s\r\n", __DATE__, __TIME__);
+  ZbApp_Log("ZIGBEE: build ble-zigbee-active-rx-20261109 | %s %s\r\n", __DATE__, __TIME__);
   ZbApp_Log("ZIGBEE-NVM: SEM2/SEM7 arbitration; verified writes; per-page erase\r\n");
   ZbApp_Log("ZIGBEE-CFG: enabled=%u; trace=enqueue/task/submit only; no extra APS callback\r\n", (unsigned int)ZB_CONFIG_TX_DIAG_ENABLED);
   if (!ZbApp_CheckWirelessFirmware())
@@ -570,9 +642,8 @@ void APP_ZIGBEE_Init(void)
       random_batch_seed = 1U;
     }
   }
-  gateway_exchange.token=random_batch_seed ^ HAL_GetUIDw2();
-  if(gateway_loaded_valid)ZbApp_GatewayBegin(0U);
   ZbApp.batch_id = random_batch_seed;
+  CommTest_Init(random_batch_seed);
   upload_nonce=random_batch_seed^HAL_GetUIDw1();
   monitor_standby.random = random_batch_seed ^ HAL_GetUIDw0();
 
@@ -636,6 +707,12 @@ void APP_ZIGBEE_Init(void)
     ZbApp.join_retry_timer = 0xFFU;
     ZbApp_Log("ZIGBEE: join retry timer unavailable\r\n");
   }
+  if (HW_TS_Create(CFG_TIM_PROC_ID_ZIGBEE, &radio_sleep.retry_timer,
+                   hw_ts_SingleShot, ZbApp_SleepRadioRetryCallback) != hw_ts_Successful)
+  {
+    radio_sleep.retry_timer = 0xFFU;
+    ZbApp_Log("ZIGBEE: STOP2 radio retry timer unavailable\r\n");
+  }
   if (HW_TS_Create(CFG_TIM_PROC_ID_ZIGBEE, &admission_timer_id,
                    hw_ts_SingleShot, ZbApp_AdmissionTimerCallback) != hw_ts_Successful)
   {
@@ -670,14 +747,16 @@ void APP_ZIGBEE_Init(void)
   }
 #endif
 
-  /* Keep the first RTC sampling deadline referenced to power-up. The
-     commissioning-window close at 30 seconds must not postpone it to 90 s. */
+  /* Reconnection obtains the next deadline from the gateway. A fresh user
+     enable after monitoring OFF still starts its first collection immediately. */
+  ZbApp_RequireSamplingSchedule();
   ZbApp.reporting_active = 1U;
   ZbApp.monitor_enabled = 0U;
   ZbApp.monitor_state = ZB_MONITOR_SLEEP;
 
 #if (CFG_ZIGBEE_NVM_ENABLED != 0U)
   ZbApp.nvm_ready = ZbApp_NvmInit() ? 1U : 0U;
+  ZbApp_LoadLocalSampling();
 #endif
 
   status = SHCI_C2_ZIGBEE_Init();
@@ -754,6 +833,8 @@ void APP_ZIGBEE_Stop(void)
   ZbApp.offline_capture_requested = 0U;
   ZbApp.pending_snapshot_valid = 0U;
   ZbApp.report_has_summary_confirm = 0U;
+  radio_sleep.pause_pending = radio_sleep.paused = radio_sleep.ble_resume_due = 0U;
+  ZbApp_FinishRadioSleep();
   ZbApp.radio_exclusive = 0U;
   ZbApp.radio_retry_pending = 0U;
   ZbApp.startup_wait_active = 0U;
@@ -783,8 +864,7 @@ uint8_t APP_ZIGBEE_IsPendingAuthorization(void)
 
 uint8_t APP_ZIGBEE_IsAdmissionSleeping(void)
 {
-  /* Application idle interval, not a paused CPU2/MAC. The wireless firmware
-   * remains responsible for its own low-power state. */
+  /* The admission timer owns this interval, including radio shutdown. */
   return (admission_phase == 3U) ? 1U : 0U;
 }
 
@@ -827,6 +907,8 @@ void APP_ZIGBEE_SetBleConnected(uint8_t connected)
   ZbApp.radio_exclusive = connected;
   if (connected != 0U)
   {
+    APP_ZIGBEE_SetBleRadioIdle(0U);
+    ZbApp_WakeSleepRadio();
     if (ZbApp.report_timer != 0xFFU)
     {
       HW_TS_Stop(ZbApp.report_timer);
@@ -850,6 +932,10 @@ void APP_ZIGBEE_SetBleConnected(uint8_t connected)
     ZbApp.monitor_state = ZB_MONITOR_WAITING;
     UTIL_SEQ_PauseTask(ZB_APP_TRAFFIC_TASKS);
   }
+  else if (radio_sleep.held)
+  {
+    radio_sleep.ble_resume_due = 1U;
+  }
   UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
 }
 
@@ -858,7 +944,7 @@ void APP_ZIGBEE_SetCommissioningWindow(uint8_t open)
   /* BLE's legacy 30-second advertising timer must not override Zigbee's
      independent authorization/recovery budget or enable monitoring. */
   if (open && !network_authorized && ZbApp.zb && !ZbApp.radio_exclusive &&
-      !ZbApp.restore_pending) {
+      !ZbApp.restore_pending && ZbApp.join_status!=ZB_STATUS_SUCCESS) {
     ZbApp.join_blocked_until_reset = 0U;
     ZbApp_StartAdmissionBudget(2U);
     UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
@@ -877,6 +963,147 @@ static void ZbApp_RadioPausedCallback(void *arg)
   }
 }
 
+void APP_ZIGBEE_SetBleRadioIdle(uint8_t idle)
+{
+  radio_sleep.ble_idle = idle != 0U;
+  if (radio_sleep.held && idle)
+    UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
+}
+
+static void ZbApp_RequestRadioSleep(ZbRadioSleepReason reason)
+{
+  if (ZbApp.zb == NULL || ZbApp.radio_exclusive || radio_sleep.reason == reason)
+    return;
+
+  /* Set the gate before the next idle decision. BLE holds its own STOP2 lock. */
+  UTIL_LPM_SetStopMode(1U << CFG_LPM_ZIGBEE_RADIO_SLEEP, UTIL_LPM_DISABLE);
+  radio_sleep.held = 1U;
+  radio_sleep.reason = reason;
+  UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
+}
+
+static void ZbApp_WakeSleepRadio(void)
+{
+  if (radio_sleep.reason == ZB_RADIO_SLEEP_NONE)
+    return;
+
+  /* RTC callbacks only request resume. IPCC calls stay in sequencer context. */
+  UTIL_LPM_SetStopMode(1U << CFG_LPM_ZIGBEE_RADIO_SLEEP, UTIL_LPM_DISABLE);
+  radio_sleep.reason = ZB_RADIO_SLEEP_NONE;
+  UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
+}
+
+static void ZbApp_FinishRadioSleep(void)
+{
+  if (!radio_sleep.held)
+    return;
+
+  radio_sleep.reason = ZB_RADIO_SLEEP_NONE;
+  radio_sleep.held = 0U;
+  if (radio_sleep.retry_timer != 0xFFU)
+    HW_TS_Stop(radio_sleep.retry_timer);
+  UTIL_SEQ_ResumeTask(ZB_SLEEP_EXTRA_TASKS);
+  if (!ZbApp.radio_exclusive)
+    UTIL_SEQ_ResumeTask(ZB_APP_TRAFFIC_TASKS);
+  UTIL_LPM_SetStopMode(1U << CFG_LPM_ZIGBEE_RADIO_SLEEP, UTIL_LPM_ENABLE);
+}
+
+static void ZbApp_SleepRadioRetryCallback(void)
+{
+  if (radio_sleep.held)
+    UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
+}
+
+static void ZbApp_SleepRadioPausedCallback(void *arg)
+{
+  UNUSED(arg);
+  if (!radio_sleep.pause_pending)
+    return;
+
+  radio_sleep.pause_pending = 0U;
+  radio_sleep.paused = 1U;
+  UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RADIO_CONTROL, CFG_SCH_PRIO_0);
+}
+
+static bool ZbApp_ServiceSleepRadio(void)
+{
+  if (radio_sleep.pause_pending)
+    return true;
+  if (!radio_sleep.held || ZbApp.radio_exclusive ||
+      ZbApp.radio_paused || ZbApp.radio_pause_pending)
+    return false;
+
+  /* A deadline or a Leave notification may arrive during asynchronous pause. */
+  if (sampling_due || (ZbUploadQueueSleeping && ZbUploadQueueWake) || leave_cleanup_pending)
+    ZbApp_WakeSleepRadio();
+
+  if (radio_sleep.reason == ZB_RADIO_SLEEP_NONE)
+  {
+    if (radio_sleep.paused)
+    {
+      enum ZbStatusCodeT status = ZbStateResume(ZbApp.zb);
+      if (status != ZB_STATUS_SUCCESS)
+      {
+        ZbApp_Log("ZIGBEE: STOP2 MAC resume rejected status=0x%02x; retrying\r\n",
+                 (unsigned int)status);
+        ZbApp_StartTimer(radio_sleep.retry_timer, 1000U);
+        return true;
+      }
+      radio_sleep.paused = 0U;
+      ZbApp_Log("ZIGBEE: MAC resumed after STOP2 idle\r\n");
+    }
+    ZbApp_FinishRadioSleep();
+    if (radio_sleep.ble_resume_due)
+    {
+      radio_sleep.ble_resume_due = 0U;
+      return false;
+    }
+    return true;
+  }
+
+  if (!radio_sleep.ble_idle || radio_sleep.retry_timer == 0xFFU)
+    return true;
+
+  if (radio_sleep.paused)
+  {
+    ZbApp_Log("ZIGBEE: MAC pause confirmed for STOP2 reason=%u\r\n",
+             (unsigned int)radio_sleep.reason);
+    /* A timer interrupt may cancel sleep while a log is being written. */
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    if (radio_sleep.reason != ZB_RADIO_SLEEP_NONE)
+      UTIL_LPM_SetStopMode(1U << CFG_LPM_ZIGBEE_RADIO_SLEEP, UTIL_LPM_ENABLE);
+    __set_PRIMASK(irq_state);
+    return true;
+  }
+
+  if (APP_ZIGBEE_IsTransmitting() || APP_ZIGBEE_IsMeasuring() || ZbSamplingCapture ||
+      comm_test.active ||
+      ZbApp.restore_pending || ZbApp.restore_recovery_active ||
+      ZbApp.persist_tx_hold || gateway_exchange.active || ZbApp.channel_migration_wait)
+  {
+    ZbApp_StartTimer(radio_sleep.retry_timer, ZB_SLEEP_RADIO_RETRY_MS);
+    return true;
+  }
+
+  /* Hold the existing batch and queued tasks. Keep the CPU2 notifications
+     and the radio control task runnable for the pause callback and wake. */
+  UTIL_SEQ_PauseTask(ZB_APP_TRAFFIC_TASKS | ZB_SLEEP_EXTRA_TASKS);
+  radio_sleep.pause_pending = 1U;
+  enum ZbStatusCodeT status = ZbStatePause(ZbApp.zb, ZbApp_SleepRadioPausedCallback, NULL);
+  if (status != ZB_STATUS_SUCCESS)
+  {
+    radio_sleep.pause_pending = 0U;
+    UTIL_SEQ_ResumeTask(ZB_SLEEP_EXTRA_TASKS);
+    if (!ZbApp.radio_exclusive)
+      UTIL_SEQ_ResumeTask(ZB_APP_TRAFFIC_TASKS);
+    ZbApp_Log("ZIGBEE: STOP2 MAC pause rejected status=0x%02x; retrying\r\n",
+             (unsigned int)status);
+    ZbApp_StartTimer(radio_sleep.retry_timer, 1000U);
+  }
+  return true;
+}
+
 /* BLE retains priority and the original pause/resume interface. */
 static void ZbApp_RadioControlTask(void)
 {
@@ -889,6 +1116,11 @@ static void ZbApp_RadioControlTask(void)
   if ((ZbApp.startup_wait_active != 0U) ||
       (startup_operation_inflight != 0U) || (persist_restore_inflight != 0U))
   {
+    if (radio_sleep.held && !ZbApp.radio_exclusive)
+    {
+      ZbApp_StartTimer(radio_sleep.retry_timer, ZB_SLEEP_RADIO_RETRY_MS);
+      return;
+    }
     if (ZbApp.radio_control_deferred == 0U)
     {
       ZbApp_Log("ZIGBEE: radio switch deferred until join/rejoin completes\r\n");
@@ -899,6 +1131,8 @@ static void ZbApp_RadioControlTask(void)
     return;
   }
   ZbApp.radio_control_deferred = 0U;
+
+  if (ZbApp_ServiceSleepRadio()) return;
 
   if (ZbApp.radio_exclusive != 0U)
   {
@@ -920,10 +1154,9 @@ static void ZbApp_RadioControlTask(void)
       ZbApp_StartTimer(ZbApp.join_retry_timer, 50U);
       return;
     }
-    ZbApp_StopUploadFastPoll();
     ZbApp_StopConfigTransaction();
     ZbApp.config_query_pending = 0U;
-    ZbApp_StopAdmissionFastPoll();
+    PendingLink_Stop();
     /* No APS callback is outstanding here. Drop stale queued control frames;
        the retained Flash descriptor reconstructs the upload after resume. */
     ZbApp_ResetTxQueue();
@@ -936,6 +1169,15 @@ static void ZbApp_RadioControlTask(void)
     ZbUploadQueueSleeping = 0U;
     ZbApp.upload_allowed = 0U; /* Committed Flash batches are retained. */
     ZbSamplingCapture=0U;
+    if (radio_sleep.paused)
+    {
+      /* BLE may take ownership after a pending sleep pause completes. */
+      radio_sleep.paused = 0U;
+      ZbApp.radio_paused = 1U;
+      ZbApp_FinishRadioSleep();
+      return;
+    }
+    ZbApp_FinishRadioSleep();
     status = ZbStatePause(ZbApp.zb, ZbApp_RadioPausedCallback, NULL);
     if (status == ZB_STATUS_SUCCESS)
     {
@@ -969,6 +1211,7 @@ static void ZbApp_RadioControlTask(void)
       return;
     }
     ZbApp.radio_paused = 0U;
+    radio_sleep.ble_resume_due = 0U;
     ZbApp_Log("ZIGBEE: MAC resumed after BLE disconnect\r\n");
   }
 
@@ -996,6 +1239,10 @@ static void ZbApp_RadioControlTask(void)
     }
 #endif
     ZbApp_ScheduleNextReport();
+    if (gateway_exchange.active) {
+      ZbApp_StartConfigTransaction();
+      UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    }
     uint8_t pending[V2_BATCH_LEN];
     if (ZigbeeVibrationStore_Pending(pending) && network_authorized) {
       ZbApp.upload_allowed = 1U;
@@ -1030,6 +1277,7 @@ static void ZbApp_StartAdmissionBudget(uint8_t phase)
   if (admission_timer_id == 0xFFU) return;
   admission_phase = phase;
   admission_expired = 0U;
+  fresh_join_grace_active = 0U;
   ZbApp.commissioning_window_open = 1U;
   ZbApp_StartTimer(admission_timer_id, phase == 1U ?
       ZB_SAVED_NETWORK_BUDGET_MS : ZB_FRESH_ADMISSION_BUDGET_MS);
@@ -1042,7 +1290,17 @@ static void ZbApp_AdmissionTimerCallback(void)
 {
   if (admission_phase == 3U)
   {
+    ZbApp_WakeSleepRadio();
     UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_ADMISSION_WAKE, CFG_SCH_PRIO_0);
+    return;
+  }
+  if (admission_phase == 2U && !fresh_join_grace_active &&
+      startup_operation_inflight)
+  {
+    /* Keep only the already submitted startup valid for one grace period.
+     * The single-shot timer has already been unlinked by the timer server. */
+    fresh_join_grace_active = 1U;
+    ZbApp_StartTimer(admission_timer_id, ZB_FRESH_JOIN_COMPLETION_GRACE_MS);
     return;
   }
   admission_expired = 1U;
@@ -1054,56 +1312,34 @@ static void ZbApp_AdmissionTimerCallback(void)
 
 static void ZbApp_CheckAuthorizationBudget(void)
 {
+  if(!network_authorized && APP_ZIGBEE_IsConnected() && !admission_expired) {
+    if(admission_timer_id!=0xFFU)HW_TS_Stop(admission_timer_id);
+    admission_phase=0U;ZbApp.commissioning_window_open=0U;
+    if(!ZbApp.monitor_enabled || !ZbApp.config_valid) {
+      /* Protocol membership is complete, but only a gateway enable policy
+       * represents the user's authorization. Never time out a pending user. */
+      UTIL_LPM_SetStopMode(1U<<CFG_LPM_NODE_ADMISSION,UTIL_LPM_DISABLE);
+      PendingLink_Start();
+      return;
+    }
+  }
   if (network_authorized == 0U && admission_expired == 0U &&
-      ZbApp.join_status == ZB_STATUS_SUCCESS) {
+      ZbApp.join_status == ZB_STATUS_SUCCESS && ZbApp.monitor_enabled && ZbApp.config_valid) {
     if (admission_timer_id != 0xFFU) HW_TS_Stop(admission_timer_id);
     network_authorized = 1U;
+    UTIL_LPM_SetStopMode(1U<<CFG_LPM_NODE_ADMISSION,UTIL_LPM_ENABLE);
 #if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
     bool authorization_saved = ZbApp_NvmWriteAuthorization();
 #endif
     admission_phase = 0U;
-    ZbApp_StopAdmissionFastPoll();
+    PendingLink_Stop();
     UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_ENABLE);
-    ZbApp_Log("ZIGBEE: network membership accepted; normal low-power operation enabled\r\n");
+    ZbApp_Log("ZIGBEE: user admission accepted; monitoring enabled, normal low-power operation allowed\r\n");
 #if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
     ZbApp_SchedulePersistSave(authorization_saved != false ?
-        ZB_PERSIST_SAVE_DELAY_MS : ZB_PENDING_PERSIST_DELAY_MS);
+        ZB_PERSIST_SAVE_DELAY_MS : ZB_PENDING_PERSIST_DELAY_MS, "authorization");
 #endif
   }
-}
-
-static void ZbApp_StartAdmissionFastPoll(void)
-{
-  if ((ZbAdmissionFastPoll != NULL) || (ZbApp.zb == NULL) ||
-      (network_authorized != 0U) ||
-      (ZbApp.join_status != ZB_STATUS_SUCCESS))
-  {
-    return;
-  }
-  ZbAdmissionFastPoll = ZbNwkFastPollRequest(
-      ZbApp.zb, ZB_NWK_SYNC_DEFAULT_DELAY_MS, 0U);
-  if (ZbAdmissionFastPoll != NULL)
-  {
-    UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_DISABLE);
-    ZbApp_Log("ZIGBEE: membership verification fast-poll active\r\n");
-  }
-  else
-  {
-    ZbApp_Log("ZIGBEE: membership verification fast-poll request failed\r\n");
-  }
-}
-
-static void ZbApp_StopAdmissionFastPoll(void)
-{
-  if (ZbAdmissionFastPoll == NULL)
-  {
-    return;
-  }
-  if (ZbApp.zb != NULL)
-  {
-    (void)ZbNwkFastPollRelease(ZbApp.zb, ZbAdmissionFastPoll);
-  }
-  ZbAdmissionFastPoll = NULL;
 }
 
 /* TX power is an interface setting, not an RF-on request. CPU2 still controls
@@ -1127,14 +1363,28 @@ static void ZbApp_SetMaximumTxPower(void)
   UTIL_LPM_SetStopMode(1U << CFG_LPM_SECURITY_DIAG, UTIL_LPM_ENABLE);
 }
 
+static void ZbApp_ReadReceiveMode(void)
+{
+  uint8_t capability = 0U;
+  enum ZbStatusCodeT status = ZbNwkGet(ZbApp.zb, ZB_NWK_NIB_ID_CapabilityInformation,
+                                     &capability, sizeof(capability));
+  const uint8_t rx_on = (status == ZB_STATUS_SUCCESS) &&
+                        ((capability & MCP_ASSOC_CAP_RXONIDLE) != 0U);
+  ZbApp_Log("ZIGBEE: receiver mode=%s capability=0x%02x read=0x%02x\r\n",
+            status != ZB_STATUS_SUCCESS ? "unverified" :
+            rx_on ? "always-on when idle" : "legacy association, rejoin required for always-on RX",
+            (unsigned int)capability, (unsigned int)status);
+}
+
 static void ZbApp_EnterAdmissionSleep(void)
 {
   admission_phase = 3U;
   admission_expired = 0U;
+  ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_ADMISSION);
   ZbApp_StartTimer(admission_timer_id, ZB_UNAPPROVED_WAKE_DELAY_MS);
   UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_ENABLE);
   Custom_APP_ZigbeeActivityChanged();
-  ZbApp_Log("ZIGBEE: unapproved node idle for 5 minutes; STOP2 allowed, CPU2 low power managed by stack\r\n");
+  ZbApp_Log("ZIGBEE: unapproved node idle for 5 minutes; preparing STOP2\r\n");
 }
 
 static void ZbApp_AdmissionWakeTask(void)
@@ -1292,7 +1542,10 @@ static void ZbApp_AdmissionTimeoutTask(void)
     ZbApp.commissioning_window_open = 0U;
     ZbApp.reporting_active = 0U;
     ZbApp.monitor_state = ZB_MONITOR_SLEEP;
-    ZbApp_Log("ZIGBEE: 30 s fresh-join window expired; commissioning stopped\r\n");
+    if (fresh_join_grace_active)
+      ZbApp_Log("ZIGBEE: fresh-join completion grace ended without success; commissioning stopped\r\n");
+    else
+      ZbApp_Log("ZIGBEE: 30 s fresh-join window expired; commissioning stopped\r\n");
     ZbApp_EnterAdmissionSleep();
   }
 }
@@ -1577,8 +1830,11 @@ static void ZbApp_NetworkJoin(void)
   uint8_t rtc_triggered;
   uint8_t rejoin_existing;
 
+  if(upload_health.pending && upload_health.backoff)return;
+
   if ((ZbApp.radio_exclusive != 0U) ||
       (ZbApp.startup_wait_active != 0U) ||
+      (admission_expired != 0U) ||
       (ZbApp.zb == NULL) ||
       (ZbApp.restore_pending != 0U) ||
       (ZbApp.rejoin_probe_pending != 0U) ||
@@ -1638,10 +1894,8 @@ static void ZbApp_NetworkJoin(void)
           ((ZbApp.restore_recovery_active != 0U) &&
            (ZbApp.rejoin_channel_mask != 0U)) ?
           ZbApp.rejoin_channel_mask : ZB_ALL_CHANNELS_MASK;
-      config.capability &= ~(MCP_ASSOC_CAP_DEV_TYPE |
-                             MCP_ASSOC_CAP_ALT_COORD |
-                             MCP_ASSOC_CAP_RXONIDLE);
-      config.fastPollPeriod = 250U;
+      config.capability &= ~(MCP_ASSOC_CAP_DEV_TYPE | MCP_ASSOC_CAP_ALT_COORD);
+      config.capability |= MCP_ASSOC_CAP_RXONIDLE;
       config.endDeviceTimeout = 0xFFU;
       if (ZbApp.restore_recovery_active != 0U)
       {
@@ -1683,17 +1937,20 @@ static void ZbApp_NetworkJoin(void)
     config.channelList.count = 1U;
     config.channelList.list[0].page = 0U;
     config.channelList.list[0].channelMask = ZB_ALL_CHANNELS_MASK;
-    /* Sleepy end device: the parent buffers downlink data until our RTC poll. */
-    config.capability &= ~(MCP_ASSOC_CAP_DEV_TYPE |
-                           MCP_ASSOC_CAP_ALT_COORD |
-                           MCP_ASSOC_CAP_RXONIDLE);
-    config.fastPollPeriod = 250U;
+    /* Stay an end device and declare the always-on receiver to the parent. */
+    config.capability &= ~(MCP_ASSOC_CAP_DEV_TYPE | MCP_ASSOC_CAP_ALT_COORD);
+    config.capability |= MCP_ASSOC_CAP_RXONIDLE;
     config.endDeviceTimeout = 0xFFU;
 
     ZbApp_Log("ZIGBEE: scanning channels 11-26\r\n");
     status = ZbStartupWait(ZbApp.zb, &config);
   }
   ZbApp.startup_wait_active = 0U;
+  if (fresh_join_grace_active && admission_phase == 2U) {
+    ZbApp_Log("ZIGBEE-DIAG: fresh-join completion grace used (%lu ms); startup status=0x%02x\r\n",
+        (unsigned long)ZB_FRESH_JOIN_COMPLETION_GRACE_MS, (unsigned int)status);
+    if (status != ZB_STATUS_SUCCESS) admission_expired = 1U;
+  }
   if (admission_expired != 0U) {
     ZbApp_AdmissionTimeoutTask();
     UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_ENABLE);
@@ -1716,6 +1973,7 @@ static void ZbApp_NetworkJoin(void)
   }
   if (status == ZB_STATUS_SUCCESS)
   {
+    ZbApp_ReadReceiveMode();
     if (rejoin_existing != 0U)
     {
       /* ZbStartup(ZbStartTypeRejoin) can report success as soon as the local
@@ -1763,18 +2021,15 @@ static void ZbApp_NetworkJoin(void)
     ZbApp_Log("ZIGBEE: join success, endpoint=1; private coordinator endpoint learned by HELLO\r\n");
     if ((admission_phase == 2U) && (network_authorized == 0U))
     {
-      /* Membership is accepted immediately. Keep a bounded fast-poll window
-       * for descriptor discovery; closing PermitJoin does not evict us. */
+      /* Stay awake for descriptor discovery and user authorization.
+       * Closing PermitJoin does not evict an existing member. */
       HW_TS_Stop(admission_timer_id);
       admission_expired = 0U;
       ZbApp.commissioning_window_open = 0U;
-      ZbApp_StartAdmissionFastPoll();
+      PendingLink_Start();
       Custom_APP_ZigbeeActivityChanged();
       ZbApp_CheckAuthorizationBudget();
-      (void)ZbNwkFastPollRequest(ZbApp.zb,250U,30000U);
     }
-    /* Uplink-only sleepy node: the 60-second report is also the parent
-       keepalive, so CPU2 is not woken by a separate maintenance poll. */
     /* A successful fresh Join normally makes the stack send Device Announce,
        but that notification can be missed around a rapid Leave/recommission
        cycle. Send one explicit standard announcement as well so the gateway
@@ -1807,10 +2062,10 @@ static void ZbApp_NetworkJoin(void)
      (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U))
     if (ZbApp.nvm_ready != 0U)
     {
-      ZbApp_EnablePersistence();
+      ZbApp_EnablePersistence("join");
       uint32_t persist_delay = network_authorized != 0U ?
           ZB_PERSIST_SAVE_DELAY_MS : ZB_PENDING_PERSIST_DELAY_MS;
-      ZbApp_SchedulePersistSave(persist_delay);
+      ZbApp_SchedulePersistSave(persist_delay, "join");
       ZbApp_Log("ZIGBEE: %s network persistence scheduled (%lu ms)\r\n",
                 network_authorized != 0U ? "authorized" : "pending",
                 (unsigned long)persist_delay);
@@ -1900,31 +2155,6 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
   if (data_indication && data_indication->clusterId!=hy_cluster_for_command(header->cmdId))
     return ZCL_STATUS_UNSUPP_COMMAND;
 
-  if (header->cmdId == COMM_ZB_CONTROL_COMMAND) {
-    /* 明确的应用层收妥/休眠决策：仅接受可信协调器、完整公共帧及当前轮次。 */
-    if(payload && length>=COMM_HEADER_SIZE && payload[0]==COMM_VERSION &&
-        payload[1]==COMM_KIND_RESPONSE && payload[2]==COMM_DATA_GATEWAY_EXCHANGE) {
-      if(payload[3] || length!=COMM_HEADER_SIZE+COMM_GATEWAY_ACK_SIZE ||
-          Comm_ReadU16(payload+6)!=COMM_GATEWAY_ACK_SIZE ||
-          !gateway_decision(&gateway_exchange,payload+8,COMM_GATEWAY_ACK_SIZE,Comm_ReadU16(payload+4)))
-        return ZCL_STATUS_INVALID_FIELD;
-      ZbApp_Log("ZIGBEE: gateway receipt batch=%lu revision=%lu valid=%u mask=%04x\r\n",
-          (unsigned long)gateway_exchange.batch,(unsigned long)gateway_exchange.revision,
-          gateway_exchange.valid,gateway_exchange.mask);
-      return ZCL_STATUS_SUCCESS;
-    }
-    if(gateway_legacy_reply_pending)return ZCL_STATUS_INSUFFICIENT_SPACE;
-    /* 入网初始化允许建立配置；运行中的控制只在本轮网关声明有命令后接收。 */
-    if(ZbApp.config_valid && (!gateway_exchange.active || !gateway_exchange.commands))
-      return ZCL_STATUS_FAILURE;
-    CommSource source={COMM_LINK_ZIGBEE,command_confirm_generation};
-    Comm_SetSession(COMM_LINK_ZIGBEE,source.session);
-    CommResult result=Comm_Receive(&source,payload,length);
-    if(result==COMM_OK)protocol_peer_enabled=1U;
-    return result==COMM_OK ? ZCL_STATUS_SUCCESS :
-        (result==COMM_BUSY ? ZCL_STATUS_INSUFFICIENT_SPACE : ZCL_STATUS_INVALID_FIELD);
-  }
-
   if (header->cmdId == 0x11U || header->cmdId == 0x12U) {
     if (!trusted_coordinator || payload == NULL ||
         admission_phase != 1U || ZbApp.restore_recovery_active == 0U ||
@@ -1946,23 +2176,16 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
     return ZCL_STATUS_SUCCESS;
   }
 
+  if (header->cmdId == COMM_TEST_REPLY) {
+    CommTest_Reply(payload,length);
+    return ZCL_STATUS_SUCCESS;
+  }
   if (header->cmdId == 0x10U) {
     if (!trusted_coordinator || length != 2U || payload == NULL)
       return ZCL_STATUS_INVALID_FIELD;
     /* Probe only: never authorizes acquisition or changes monitoring cadence. */
-    if (!ZbApp.config_valid && !ZbApp.radio_exclusive)
-      (void)ZbNwkFastPollRequest(ZbApp.zb, 250U, 10000U);
     return ZbApp_SendCommand(0x9BU, payload, 2U);
   }
-
-  if((header->cmdId==ZB_CMD_MONITOR_CONTROL || header->cmdId==ZB_CMD_MONITOR_CONFIG ||
-      header->cmdId==ZB_CMD_REPORT_START || header->cmdId==ZB_CMD_REPORT_STOP) &&
-      (gateway_legacy_reply_pending || Comm_HasPending()))return ZCL_STATUS_INSUFFICIENT_SPACE;
-
-  if((header->cmdId==ZB_CMD_MONITOR_CONTROL || header->cmdId==ZB_CMD_MONITOR_CONFIG ||
-      header->cmdId==ZB_CMD_REPORT_START || header->cmdId==ZB_CMD_REPORT_STOP) &&
-      ZbApp.config_valid && (!gateway_exchange.active || !gateway_exchange.commands))
-    return ZCL_STATUS_FAILURE;
 
   if ((header->cmdId == V2_ACK) ||
       (header->cmdId == ZB_CMD_MONITOR_CONTROL) ||
@@ -1990,6 +2213,11 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
   if ((header->cmdId == V2_ACK) && (payload != NULL) &&
       (length == V2_ACK_LEN))
   {
+    ZbApp_TraceReply(payload,length,header->seqNum);
+    if(payload[1]==UPLOAD_COMPLETION_KIND) {
+      (void)ZbApp_AcceptCompletedBatch(payload,length);
+      return ZCL_STATUS_SUCCESS;
+    }
     if(payload[0]==V2_VERSION && payload[1]==UPLOAD_LEASE_KIND) {
       int result=upload_lease_receive(&upload_lease,payload,length,APP_ElapsedMs());
       if(result>0)ZbApp_Log("ZIGBEE: upload lease confirmed batch=%lu nonce=%lu remaining=%lu ms\r\n",
@@ -2012,7 +2240,7 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
     }
     if (payload[0] == V2_VERSION && payload[1] == V2_KIND_FEATURES)
     {
-      if (ZbDeferred.active && ZbDeferred.raw_done &&
+      if (ZbDeferred.active && !ZbDeferred.confirmed && ZbDeferred.raw_done &&
           ZbDeferred.features_ready && ZbDeferred.queued &&
           v2_u32(payload+2U) == ZbDeferred.batch)
       {
@@ -2041,6 +2269,28 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
   if ((header->cmdId == ZB_CMD_MONITOR_CONTROL) &&
       (payload != NULL) && (length >= 1U))
   {
+    if (payload[0] == ZB_MONITOR_OP_AUTHORIZE && length == 1U)
+    {
+      if (!APP_ZIGBEE_IsConnected()) return ZCL_STATUS_FAILURE;
+      if (!ZbApp.config_valid) ZbApp_LoadLocalSampling();
+      if (!network_authorized || !ZbApp.monitor_enabled) {
+        ZbApp_ApplyMonitorSwitch(ZB_CONFIG_FLAG_MONITOR_PRESENT | ZB_CONFIG_FLAG_MONITOR_ENABLED);
+        sampling_resume_pending=0U;
+        ZbApp.reporting_active=1U;
+        ZbApp.config_query_pending=0U;
+        recovery_config_pending=0U;
+        if (ZbApp.report_timer!=0xFFU) HW_TS_Stop(ZbApp.report_timer);
+        ZbApp_StopConfigTransaction();
+        ZbApp_CheckAuthorizationBudget();
+        if (!network_authorized) return ZCL_STATUS_FAILURE;
+        ZbApp_SendLinkStatus(1U);
+        UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_REPORT, CFG_SCH_PRIO_1);
+      } else {
+        /* A repeated grant only repeats the confirmation. */
+        ZbApp_SendLinkStatus(1U);
+      }
+      return ZCL_STATUS_SUCCESS;
+    }
     if ((payload[0] == 0x01U) && (length >= 2U))
     {
       uint8_t was_enabled = ZbApp_ApplyMonitorSwitch(ZB_CONFIG_FLAG_MONITOR_PRESENT |
@@ -2052,7 +2302,7 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
         if(sampling_timer!=0xFFU)HW_TS_Stop(sampling_timer);
         ZbApp.monitor_state = ZB_MONITOR_SLEEP;
         if ((ZbApp.report_timer != 0xFFU) &&
-            (ZbApp.audio_waiting == 0U))
+            (ZbApp.audio_waiting == 0U) && !ZbApp.config_query_pending)
         {
           HW_TS_Stop(ZbApp.report_timer);
         }
@@ -2061,7 +2311,6 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
       {
         ZbApp.monitor_state = ZB_MONITOR_WAITING;
       }
-      ZbApp_GatewayChanged();
       (void)ZbApp_SendMonitorState(ZbApp.monitor_state);
       if (!ZbApp.monitor_enabled && !ZbApp.config_query_pending)
         ZbApp_ScheduleMonitorStandby();
@@ -2097,55 +2346,87 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
     return ZCL_STATUS_INVALID_FIELD;
   }
 
-  if ((header->cmdId == ZB_CMD_MONITOR_CONFIG) &&
+  if (header->cmdId==CONTROL_RESUME_SCHEDULE_CMD) {
+    if (!payload || length!=CONTROL_RESUME_SCHEDULE_SIZE || payload[0]>1U ||
+        !network_authorized || !ZbApp.config_valid || !sampling_resume_pending ||
+        !ZbApp.config_query_pending || ZbApp.config_query_attempts!=2U)
+      return ZCL_STATUS_INVALID_FIELD;
+    uint32_t epoch=control_read_hash(payload+1),delay=control_read_hash(payload+5);
+    if (payload[0] && (!epoch || !delay || delay>INT32_MAX)) return ZCL_STATUS_INVALID_VALUE;
+    if (payload[0]) {
+      ZbApp_ApplyMonitorSwitch(ZB_CONFIG_FLAG_MONITOR_PRESENT | ZB_CONFIG_FLAG_MONITOR_ENABLED);
+      (void)ZbApp_ApplySamplingDeadline(epoch,delay);
+    } else {
+      ZbApp_ApplyMonitorSwitch(ZB_CONFIG_FLAG_MONITOR_PRESENT);
+      post_upload_config_due=0U;
+    }
+    if (post_upload_config_due && network_authorized) {
+      ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
+    } else {
+      ZbApp.config_query_pending=0U;
+      if (ZbApp.report_timer!=0xFFU) HW_TS_Stop(ZbApp.report_timer);
+      ZbApp_StopConfigTransaction();
+      if (ZbApp.monitor_enabled) ZbApp_ResumeCachedUpload();
+      else ZbApp_ScheduleMonitorStandby();
+    }
+    return ZCL_STATUS_SUCCESS;
+  }
+
+  uint8_t exchange_config=0U;
+  if (header->cmdId==GX_CONTROL) {
+    if (!gateway_exchange.active || !gateway_exchange.advertised || sampling_resume_pending ||
+        (!gx_frame(payload,length,GX_RESPONSE,GX_READY,GX_DECISION_SIZE) &&
+         !gx_frame(payload,length,GX_COMMAND,GX_SAMPLING,GX_SAMPLING_SIZE)))
+      return ZCL_STATUS_INVALID_FIELD;
+    const uint8_t *body=payload+GX_HEADER;
+    if (gx_get32(body)!=gateway_exchange.token || gx_get32(body+4)!=gateway_exchange.batch)
+      return ZCL_STATUS_INVALID_FIELD;
+    uint16_t seq=gx_get16(payload+4);
+    if (payload[1]==GX_RESPONSE) {
+      if (gx_get32(body+8)!=gateway_exchange.revision) return ZCL_STATUS_INVALID_FIELD;
+      uint16_t mask=gx_get16(body+13);
+      if (!gx_decision_valid(seq,gateway_exchange.decision,body[12],mask))
+        return ZCL_STATUS_INVALID_FIELD;
+      if (!gateway_exchange.decision || gateway_exchange.commands!=(mask==GX_COMMANDS_PENDING) || body[12])
+        ZbApp_Log("ZIGBEE: gateway decision batch=%lu rev=%lu seq=%u result=%u mask=%04x\r\n",
+                  (unsigned long)gateway_exchange.batch,(unsigned long)gateway_exchange.revision,
+                  (unsigned)seq,(unsigned)body[12],(unsigned)mask);
+      gateway_exchange.decision=seq;
+      gateway_exchange.probe_at=APP_ElapsedMs()+10000U;
+      gateway_exchange.commands=mask==GX_COMMANDS_PENDING;
+      gateway_exchange.permit=mask==GX_SLEEP_ALLOWED && !gateway_exchange.save_error;
+      gateway_exchange.rejected=body[12]!=0U;
+      UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+      return ZCL_STATUS_SUCCESS;
+    }
+    if (gateway_exchange.final_valid && seq==gateway_exchange.command_seq) {
+      if (memcmp(body,gateway_exchange.command,GX_SAMPLING_SIZE)) return ZCL_STATUS_INVALID_FIELD;
+      UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+      return ZCL_STATUS_SUCCESS;
+    }
+    if (!seq || (gateway_exchange.final_valid && !gx_newer(seq,gateway_exchange.command_seq)) ||
+        gx_get32(body+8)!=gateway_exchange.revision || !gateway_exchange.commands || gateway_exchange.permit)
+      return ZCL_STATUS_FAILURE;
+    gateway_exchange.command_seq=seq;
+    memcpy(gateway_exchange.command,body,GX_SAMPLING_SIZE);
+    exchange_config=1U;
+    payload=body+GX_KEY_SIZE;
+    length=CONTROL_CONFIG_SIZE;
+  }
+
+  if ((exchange_config || header->cmdId == ZB_CMD_MONITOR_CONFIG) &&
       (payload != NULL) &&
       ((length == 20U) || (length == 26U) || (length == 28U) ||
        (length == 29U)))
   {
-    ZbMonitorConfig_t next;
+    if (!exchange_config && (network_authorized || !ZbApp.config_query_pending ||
+        ZbApp.config_query_attempts!=2U || sampling_resume_pending))
+      return ZCL_STATUS_FAILURE;
+    ZbMonitorConfig_t next = ZbApp_DecodeSampling(payload,length);
     uint8_t had_pending_query = ZbApp.config_query_pending;
-    next.auto_interval_sec = (uint32_t)payload[0] |
-        ((uint32_t)payload[1] << 8U) | ((uint32_t)payload[2] << 16U) |
-        ((uint32_t)payload[3] << 24U);
-    next.poll_interval_sec = (uint16_t)payload[4] |
-        ((uint16_t)payload[5] << 8U);
-    next.vibration_rate_hz = (uint16_t)payload[6] |
-        ((uint16_t)payload[7] << 8U);
-    next.digital_mic_rate_hz = (uint16_t)payload[8] |
-        ((uint16_t)payload[9] << 8U);
-    next.analog_mic_rate_hz = (uint32_t)payload[10] |
-        ((uint32_t)payload[11] << 8U) | ((uint32_t)payload[12] << 16U) |
-        ((uint32_t)payload[13] << 24U);
-    next.vibration_window_ms = (uint16_t)payload[14] |
-        ((uint16_t)payload[15] << 8U);
-    next.digital_mic_window_ms = (uint16_t)payload[16] |
-        ((uint16_t)payload[17] << 8U);
-    next.analog_mic_window_ms = (uint16_t)payload[18] |
-        ((uint16_t)payload[19] << 8U);
-    next.raw_upload_every_cycles = 1U;
-    next.raw_upload_generation = 0U;
-    next.sensor_enable_mask = CUSTOM_APP_ZB_SENSOR_ALL;
-    uint8_t transaction_flags = 0U;
-    uint8_t migration_target = 0U;
-    if (length >= 26U)
-    {
-      next.raw_upload_every_cycles = (uint16_t)payload[20] |
-          ((uint16_t)payload[21] << 8U);
-      next.raw_upload_generation = (uint32_t)payload[22] |
-          ((uint32_t)payload[23] << 8U) |
-          ((uint32_t)payload[24] << 16U) |
-          ((uint32_t)payload[25] << 24U);
-    }
-    if (length >= 28U)
-    {
-      transaction_flags = payload[26];
-      migration_target = payload[27];
-    }
-    if (length == 29U)
-    {
-      next.sensor_enable_mask = payload[28];
-    }
-    if ((next.auto_interval_sec < 300U) || (next.auto_interval_sec > 2147483U) ||
+    uint8_t transaction_flags = length>=28U ? payload[26] : 0U;
+    uint8_t migration_target = length>=28U ? payload[27] : 0U;
+    if ((next.auto_interval_sec < 60U) || (next.auto_interval_sec > 2147483U) ||
         (next.poll_interval_sec == 0U) ||
         (next.vibration_rate_hz != 26667U) ||
         (next.digital_mic_rate_hz != 46875U) ||
@@ -2168,7 +2449,21 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
     {
       ZbApp_Log("ZIGBEE: invalid sampling configuration length=%u\r\n",
                 (unsigned int)length);
+      if (exchange_config) {
+        ZbApp_CompleteGatewayCommand(GX_INVALID_VALUE);
+        return ZCL_STATUS_SUCCESS;
+      }
       return ZCL_STATUS_INVALID_VALUE;
+    }
+    if ((exchange_config && !ZbApp.nvm_ready) ||
+        (ZbApp.nvm_ready && !ZbApp_SaveLocalSampling(&next))) {
+      ZbApp_Log("ZIGBEE: sampling policy NVM write failed\r\n");
+      if (exchange_config) {
+        gateway_exchange.save_error=1U;
+        ZbApp_CompleteGatewayCommand(GX_SAVE_FAILED);
+        return ZCL_STATUS_SUCCESS;
+      }
+      return ZCL_STATUS_FAILURE;
     }
     if ((next.raw_upload_generation != ZbApp.monitor_config.raw_upload_generation) ||
         (next.raw_upload_every_cycles != ZbApp.monitor_config.raw_upload_every_cycles))
@@ -2179,8 +2474,7 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
                 (unsigned int)next.raw_upload_every_cycles);
     }
     ZbApp.monitor_config = next;
-    ZbApp_GatewayChanged();
-    applied_config_hash = length==29U ? control_fingerprint(payload,29U) : 0U;
+    applied_config_hash = length>=29U ? control_fingerprint(payload,29U) : 0U;
     sampling_cadence_change(&sampling_cadence,next.auto_interval_sec*1000U);
     ZbApp_ArmSamplingTimer();
     ZbApp_Log("ZIGBEE: sensor policy mask=0x%02x vibration=%u dmic=%u amic=%u\r\n",
@@ -2189,8 +2483,20 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
               (unsigned int)((next.sensor_enable_mask & CUSTOM_APP_ZB_SENSOR_DIGITAL_MIC) != 0U),
               (unsigned int)((next.sensor_enable_mask & CUSTOM_APP_ZB_SENSOR_ANALOG_MIC) != 0U));
     ZbApp.config_valid = 1U;
-    ZbApp_CheckAuthorizationBudget();
     uint8_t was_monitoring = ZbApp_ApplyMonitorSwitch(transaction_flags);
+    ZbApp_CheckAuthorizationBudget();
+    if (exchange_config) {
+      gateway_exchange.revision++;
+      gateway_exchange.save_error=0U;
+      gateway_exchange.permit=0U;
+      ZbApp.channel_migration_wait=(transaction_flags & ZB_CONFIG_FLAG_CHANNEL_MIGRATION)!=0U;
+      ZbApp.channel_migration_target=migration_target;
+      ZbApp_CompleteGatewayCommand(0U);
+      ZbApp_Log("ZIGBEE: exchange policy stored and verified batch=%lu revision=%lu\r\n",
+                (unsigned long)gateway_exchange.batch,(unsigned long)gateway_exchange.revision);
+      return ZCL_STATUS_SUCCESS;
+    }
+    post_upload_config_due=0U;
     /* Legacy 0x0C only updates sampling parameters. Authorization and the enable
        state are carried by 0x0B, so an unconfirmed node cannot start merely
        because it received a configuration frame. */
@@ -2253,15 +2559,13 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
               (unsigned int)migration_target);
     /* Application confirmation is distinct from APS delivery. A replay of
        the same enabled configuration must not restart an active capture. */
-    /* ZCL 成功仅表示报文已接收；最终 A4 应用回复由主循环在保存/回读后发出。 */
+    ZbApp_SendLinkStatus(1U);
     return ZCL_STATUS_SUCCESS;
   }
 
   if (header->cmdId == ZB_CMD_REPORT_START)
   {
-    ZbApp_GatewayChanged();
-    /* 与 0B/0C 使用相同入口，避免只改开关却遗留监测关闭期间的 STOP2 禁止位。 */
-    (void)ZbApp_ApplyMonitorSwitch(ZB_CONFIG_FLAG_MONITOR_PRESENT | ZB_CONFIG_FLAG_MONITOR_ENABLED);
+    ZbApp.monitor_enabled = 1U;
     ZbApp_CheckAuthorizationBudget();
     if (ZbApp.config_valid != 0U)
     {
@@ -2275,7 +2579,6 @@ static enum ZclStatusCodeT ZbApp_CommandHandler(struct ZbZclClusterT *cluster,
   }
   if (header->cmdId == ZB_CMD_REPORT_STOP)
   {
-    ZbApp_GatewayChanged();
     sampling_cadence.active=0;sampling_due=0;
     if(sampling_timer!=0xFFU)HW_TS_Stop(sampling_timer);
     ZbApp.monitor_enabled = 0U;
@@ -2318,19 +2621,17 @@ static void ZbApp_ReportTask(void)
     ZbApp_StartTimer(ZbApp.report_timer,60000U);
     return;
   }
-  if (Custom_APP_ProtocolStreaming()) {
-    ZbApp_StartTimer(ZbApp.report_timer,1000U);return;
+  if (gateway_exchange.active && !sampling_resume_pending) {
+    ZbApp_ServiceGatewayExchange();
+    return;
   }
   Custom_APP_ZigbeeSnapshot_t snapshot;
-  if (!sampling_due && ZbApp_ServiceControlWindow()) return;
-  if(gateway_exchange.active && !ZbApp.audio_waiting && !ZbSamplingCapture) {
-    ZbApp_StartTimer(ZbApp.report_timer,1000U);return;
-  }
+  if ((gateway_exchange.active || !sampling_due) && ZbApp_ServiceControlWindow()) return;
   uint8_t capture_without_network = ZbApp.offline_capture_requested;
   uint8_t raw_upload_due = 0U;
   uint8_t sampling_wake = 0U;
 
-  if (sampling_due != 0U)
+  if (sampling_due != 0U && !gateway_exchange.active)
   {
     sampling_due=0;
     unsigned due=sampling_cadence_due(&sampling_cadence,APP_ElapsedMs());
@@ -2360,7 +2661,7 @@ static void ZbApp_ReportTask(void)
 
   if (recovery_config_pending != 0U) {
     recovery_config_pending = 0U;
-    ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_JOIN);
+    ZbApp_OpenControlWindow(post_upload_config_due ? ZB_CONFIG_QUERY_COLLECTION : ZB_CONFIG_QUERY_JOIN);
     return;
   }
 
@@ -2380,7 +2681,13 @@ static void ZbApp_ReportTask(void)
   if ((ZbApp.monitor_enabled == 0U) && (ZbApp.audio_waiting == 0U))
   {
     ZbApp.monitor_state = ZB_MONITOR_SLEEP;
-    if (network_authorized && !ZbApp.config_query_pending)
+    if (!network_authorized) {
+      /* Pending nodes stay awake and respond to gateway probes. Initial
+         identification still uses the control window. */
+      ZbApp_ScheduleMonitorStandby();
+      return;
+    }
+    if (!ZbApp.config_query_pending)
     {
       if (APP_ZIGBEE_IsTransmitting()) {
         /* A retained Flash upload owns radio timing even with monitoring OFF.
@@ -2398,6 +2705,8 @@ static void ZbApp_ReportTask(void)
     }
     return;
   }
+
+  if (ZbApp_WaitForSamplingDeadline(sampling_wake)) return;
 
   if ((ZbApp.audio_waiting == 0U) &&
       !ZbSamplingCapture && !sampling_wake &&
@@ -2455,9 +2764,6 @@ static void ZbApp_ReportTask(void)
     if (capture_without_network == 0U)
     {
       ZbApp_SendPendingSnapshot();
-      if(gateway_exchange.active) {
-        ZbSamplingCapture=0U;ZbApp_StartTimer(ZbApp.report_timer,1000U);return;
-      }
     }
     ZbApp.batch_id++;
     if (ZbApp.batch_id == 0U)
@@ -2539,6 +2845,8 @@ static void ZbApp_ReportTask(void)
     else
     {
       ZbApp_SendSnapshot(&snapshot, ZbApp.batch_id);
+      if (network_authorized && !(ZbApp.monitor_config.sensor_enable_mask & CUSTOM_APP_ZB_SENSOR_VIBRATION))
+        ZbApp_BeginGatewayExchange(ZbApp.batch_id,&snapshot);
       ZbApp_FinishCollectionCycle(
           ((ZbApp.monitor_config.sensor_enable_mask & CUSTOM_APP_ZB_SENSOR_VIBRATION) == 0U) ? 1U : 0U);
     }
@@ -2617,22 +2925,7 @@ static int ZbApp_ScalarSendManifest(void *context,const uint8_t *manifest)
 static void ZbApp_SendSnapshot(const Custom_APP_ZigbeeSnapshot_t *snapshot,
                                uint32_t batch_id)
 {
-  ZbApp_GatewayBegin(batch_id);
-  if(!(snapshot->valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION)) {
-    gateway_scalar_cache=*snapshot;gateway_scalar_cache_valid=1U;
-  }
   ZbApp_UpdateClusterSnapshot(snapshot,batch_id);
-  if(protocol_peer_enabled) {
-    CommScalars values={0};
-    values.valid_mask=snapshot->valid_mask & COMM_SENSOR_SCALARS;
-    values.temperature_centi_c=snapshot->temperature_centi_c;
-    memcpy(values.magnetic_0p1_ut,snapshot->magnetic_0p1_ut,sizeof(values.magnetic_0p1_ut));
-    values.digital_centi_db=(uint16_t)snapshot->digital_mic_db_spl*100U;
-    values.analog_centi_db=(uint16_t)snapshot->analog_mic_db_spl*100U;
-    if(values.valid_mask)(void)Comm_SendScalars(COMM_LINK_ZIGBEE,batch_id,&values);
-    if((snapshot->valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) && snapshot->vibration_features_ready)
-      (void)Comm_SendFeatures(COMM_LINK_ZIGBEE,batch_id,snapshot->vibration_features_milli);
-  }
   uint8_t payload[ZB_TX_MAX_PAYLOAD];
 
   ZbApp.report_has_summary_confirm = 0U;
@@ -2730,6 +3023,49 @@ static enum ZclStatusCodeT ZbApp_SendCommand(uint8_t command_id,
   return ZCL_STATUS_SUCCESS;
 }
 
+static void ZbApp_AdmissionProbeConfirm(struct ZbApsdeDataConfT *confirm, void *arg)
+{
+  if (confirm != NULL && confirm->status == ZB_STATUS_SUCCESS &&
+      (uint32_t)(uintptr_t)arg == pending_link.generation)
+  {
+    PendingLink_RecordSuccess();
+  }
+}
+
+static enum ZbStatusCodeT ZbApp_SendPendingLinkFrame(uint8_t command,
+    const uint8_t *payload, uint8_t length,
+    void (*confirm)(struct ZbApsdeDataConfT *, void *), void *arg)
+{
+  /* These short messages use APS confirmation without a ZCL Default Response. */
+  uint8_t asdu[3U + COMM_TEST_REQUEST_LEN] = {0x19U, ZbApp.upload_sequence++, command};
+  memcpy(asdu + 3U, payload, length);
+  struct ZbApsdeDataReqT request = {0};
+  request.dst.mode = ZB_APSDE_ADDRMODE_SHORT;
+  request.dst.endpoint = coordinator_endpoint;
+  request.srcEndpt = ZB_APP_ENDPOINT;
+  request.profileId = ZCL_PROFILE_HOME_AUTOMATION;
+  request.clusterId = HY_CONTROL_CLUSTER;
+  request.asdu = asdu;
+  request.asduLength = 3U + length;
+  request.txOptions = ZB_APSDE_DATAREQ_TXOPTIONS_SECURITY |
+                      ZB_APSDE_DATAREQ_TXOPTIONS_NWKKEY |
+                      ZB_APSDE_DATAREQ_TXOPTIONS_ACK;
+  request.discoverRoute = true;
+  return ZbApsdeDataReqCallback(ZbApp.zb, &request, confirm, arg);
+}
+
+static void ZbApp_SendAdmissionProbeReply(const ZbTxFrame_t *frame)
+{
+  enum ZbStatusCodeT status = ZbApp_SendPendingLinkFrame(frame->command_id,
+      frame->payload, frame->length, ZbApp_AdmissionProbeConfirm,
+      (void *)(uintptr_t)pending_link.generation);
+  if (status != ZB_STATUS_SUCCESS)
+  {
+    ZbApp_Log("PENDING-LINK: probe reply submit failed status=0x%02x\r\n",
+              (unsigned)status);
+  }
+}
+
 static void ZbApp_TxTask(void)
 {
   struct ZbZclClusterCommandReqT request;
@@ -2761,12 +3097,21 @@ static void ZbApp_TxTask(void)
          (ZbApp.tx_in_flight < ZB_TX_MAX_IN_FLIGHT))
   {
     frame = &ZbTxQueue[ZbApp.tx_tail];
+    if (frame->command_id == 0x9BU && pending_link.active)
+    {
+      if (PendingLink_Eligible()) ZbApp_SendAdmissionProbeReply(frame);
+      ZbApp.tx_tail = (uint8_t)((ZbApp.tx_tail + 1U) % ZB_TX_QUEUE_DEPTH);
+      ZbApp.tx_count--;
+      continue;
+    }
     memset(&request, 0, sizeof(request));
     request.dst.mode = ZB_APSDE_ADDRMODE_SHORT;
     request.dst.nwkAddr = 0x0000U;
     request.dst.endpoint = coordinator_endpoint;
     request.cmdId = frame->command_id;
-    request.noDefaultResp = ZCL_NO_DEFAULT_RESPONSE_TRUE;
+    /* The summary tracks a ZCL response separately from the FEATURES receipt. */
+    request.noDefaultResp = (frame->command_id == ZB_CMD_VIBRATION_SUMMARY) ?
+        ZCL_NO_DEFAULT_RESPONSE_FALSE : ZCL_NO_DEFAULT_RESPONSE_TRUE;
     request.payload = frame->payload;
     request.length = frame->length;
     if (frame->await_confirm != 0U)
@@ -2831,17 +3176,22 @@ static void ZbApp_UploadConfirm(struct ZbApsdeDataConfT *confirm, void *arg)
   ZbUploadRadioSlot_t *slot = (ZbUploadRadioSlot_t *)arg;
   if (confirm != NULL)
   {
+    if(slot)ZbApp_TraceResult(slot->frame[1],confirm->status,slot->generation!=upload_generation);
     if(slot && slot->generation==upload_generation) {
       v2_tx_radio_result(&ZbVibrationUpload, confirm->status == ZB_STATUS_SUCCESS, HAL_GetTick());
-      link_health_result(&upload_health,confirm->status==ZB_STATUS_SUCCESS);
+      link_health_confirm(&upload_health,confirm->status);
       if(upload_health.pending)UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
     }
     if (confirm->status != ZB_STATUS_SUCCESS)
-      ZbApp_Log("ZIGBEE: V2 APS confirm failed=0x%02x batch=%lu block=%u cmd=0x%02x elapsed=%lu ms generation=%lu late=%u\r\n",
+      ZbApp_Log("ZIGBEE: V2 APS confirm failed=0x%02x batch=%lu block=%u cmd=0x%02x elapsed=%lu ms generation=%lu late=%u peer_ack_failure=%u consecutive=%u reason=%s\r\n",
                 (unsigned int)confirm->status, (unsigned long)(slot?slot->batch:0),
                 slot?slot->block:0,slot?slot->command:0,
                 (unsigned long)(slot?HAL_GetTick()-slot->submitted_ms:0),
-                (unsigned long)(slot?slot->generation:0),slot && slot->generation!=upload_generation);
+                (unsigned long)(slot?slot->generation:0),slot && slot->generation!=upload_generation,
+                slot && slot->generation==upload_generation && link_health_missing_ack(confirm->status),
+                (unsigned)upload_health.failures,
+                confirm->status==ZB_WPAN_STATUS_NO_ACK ? "未收到MAC接收确认" :
+                confirm->status==ZB_APS_STATUS_NO_ACK ? "未收到APS确认" : "不计入通信失败");
   }
   if (slot != NULL)
   {
@@ -2886,6 +3236,12 @@ static int ZbApp_UploadSend(void *context, uint8_t command,
   slot->frame[1] = ZbApp.upload_sequence++;
   slot->frame[2] = command;
   memcpy(slot->frame + 3U, data, length);
+  if(command==V2_BATCH && length==V2_BATCH_LEN) {
+    slot->frame[3U+length++]=UPLOAD_COMPLETION_VERSION;
+    slot->frame[3U+length++]=(uint8_t)!ZbDeferred.feature_only;
+  } else if(command==V2_QUERY && length==10U && data[1]==UPLOAD_LEASE_KIND) {
+    slot->frame[3U+length++]=UPLOAD_COMPLETION_VERSION;
+  }
   memset(&request, 0, sizeof(request));
   request.dst.mode = ZB_APSDE_ADDRMODE_SHORT;
   request.dst.nwkAddr = 0x0000U;
@@ -2910,13 +3266,16 @@ static int ZbApp_UploadSend(void *context, uint8_t command,
   slot->submitted_ms = HAL_GetTick();
   slot->batch=ZbDeferred.batch;slot->block=ZbVibrationUpload.index;
   slot->command=command;slot->generation=upload_generation;
+  ZbApp_TracePacket(UT_NODE_TX,command,slot->frame[1],slot->frame+3,length);
   status = ZbApsdeDataReqCallback(ZbApp.zb, &request,
                                   ZbApp_UploadConfirm, slot);
   if (status != ZB_STATUS_SUCCESS)
   {
     slot->busy = 0U;
+    ZbApp_TraceResult(slot->frame[1],status,0);
     v2_tx_radio_result(&ZbVibrationUpload, 0, HAL_GetTick());
-    link_health_result(&upload_health,0);
+    /* The request was not accepted: no peer exchange has been established.
+     * Preserve diagnostics/backpressure, but never count this as link loss. */
     return 0;
   }
   Custom_APP_ZigbeeActivityChanged();
@@ -2931,25 +3290,27 @@ static int ZbApp_UploadRead(void *context, uint32_t batch, uint32_t first,
       vib_features_add(&ZbDeferred.stats, batch, first, points, raw);
 }
 
-static void ZbApp_StartUploadFastPoll(void)
+static uint8_t ZbApp_ServiceQueueWake(uint32_t now)
 {
-  if (ZbUploadFastPoll!=NULL || ZbApp.zb==NULL ||
-      !APP_ZIGBEE_IsConnected()) return;
-  uint16_t period=250U;
-  (void)ZbNwkSet(ZbApp.zb,ZB_NWK_NIB_ID_FastPollPeriod,&period,sizeof(period));
-  /* Stack-managed parent polling delivers block ACKs to the sleepy node.
-     The first argument is the initial delay, NOT a poll interval. No extra
-     NLME-SYNC requests or clock/RTT calibration are submitted by the uploader. */
-  ZbUploadFastPoll=ZbNwkFastPollRequest(ZbApp.zb,ZB_NWK_SYNC_DEFAULT_DELAY_MS,0U);
-  if (ZbUploadFastPoll==NULL)
-    ZbApp_Log("ZIGBEE: V2 upload fast-poll request failed\r\n");
-}
-
-static void ZbApp_StopUploadFastPoll(void)
-{
-  if (ZbApp.zb!=NULL && ZbUploadFastPoll!=NULL)
-    (void)ZbNwkFastPollRelease(ZbApp.zb,ZbUploadFastPoll);
-  ZbUploadFastPoll=NULL;
+  if(!ZbUploadQueueSleeping)return 0U;
+  if (!ZbUploadQueueWake)
+  {
+    ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_QUEUE);
+    return 1U;
+  }
+  const uint32_t rtc_now = APP_ElapsedMs();
+  if ((int32_t)(rtc_now - ZbUploadQueueDeadlineRtc) < 0)
+  {
+    ZbUploadQueueWake = 0U;
+    ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_QUEUE);
+    ZbApp_StartTimer(ZbApp.upload_timer, ZbUploadQueueDeadlineRtc - rtc_now);
+    return 1U;
+  }
+  ZbUploadQueueWake=ZbUploadQueueSleeping=0U;
+  v2_tx_resume(&ZbVibrationUpload,now);
+  ZbApp_Log("ZIGBEE: wake reason=UPLOAD_QUEUE; reapplying for batch=%lu, no acquisition\r\n",
+            (unsigned long)ZbDeferred.batch);
+  return 0U;
 }
 
 static void ZbApp_UploadTask(void)
@@ -2958,6 +3319,14 @@ static void ZbApp_UploadTask(void)
   static uint16_t logged_block;
   uint32_t now = HAL_GetTick();
 
+  if (gateway_exchange.active) return;
+  /* Once the durable receipt arrives, finish this batch before a new RTC
+   * deadline. Let a capture that already started finish before opening. */
+  if (ZbDeferred.active && ZbDeferred.confirmed && !ZbSamplingCapture &&
+      !ZbApp.audio_waiting && !ZbApp.radio_exclusive && !ZbApp.persist_tx_hold) {
+    if (network_authorized) ZbApp_BeginGatewayExchange(ZbDeferred.batch,NULL);
+    return;
+  }
   unsigned wake_causes=node_wake_causes(APP_ElapsedMs(),
       sampling_cadence.active && ZbApp.monitor_enabled,sampling_cadence.next,
       ZbUploadQueueSleeping,ZbUploadQueueDeadlineRtc);
@@ -2971,27 +3340,14 @@ static void ZbApp_UploadTask(void)
     ZbApp_StartTimer(ZbApp.upload_timer,100U);
     return;
   }
-  if(ZbApp_ServiceUploadRecovery())return;
-  if (ZbUploadQueueSleeping != 0U)
-  {
-    if (ZbUploadQueueWake == 0U) return;
-    if ((int32_t)(APP_ElapsedMs()-ZbUploadQueueDeadlineRtc)<0) {
-      ZbApp_StartTimer(ZbApp.upload_timer,ZbUploadQueueDeadlineRtc-APP_ElapsedMs());
-      return;
-    }
-    if (ZbApp.config_query_pending) {
-      ZbApp_StartTimer(ZbApp.upload_timer,100U);
-      return;
-    }
-    ZbUploadQueueWake=0U;
-    ZbUploadQueueSleeping=0U;
-    v2_tx_resume(&ZbVibrationUpload,now);
-    ZbApp_Log("ZIGBEE: wake reason=UPLOAD_QUEUE; reapplying for batch=%lu, no acquisition\r\n",
-              (unsigned long)ZbDeferred.batch);
-  }
-  if (ZbApp.persist_tx_hold != 0U) return;
+  if (ZbApp.persist_tx_hold != 0U || ZbApp.radio_exclusive != 0U) return;
 
-  if (ZbApp.radio_exclusive != 0U) return;
+  if(ZbApp_ServiceUploadRecovery())return;
+  if (ZbApp.config_query_pending && ZbApp.config_query_reason==ZB_CONFIG_QUERY_COLLECTION) {
+    ZbApp_StartTimer(ZbApp.upload_timer,100U);
+    return;
+  }
+  if(ZbApp_ServiceQueueWake(now))return;
   if (APP_ZIGBEE_IsConnected() == 0U)
   {
     if ((ZbApp.upload_allowed != 0U) || ZbDeferred.active ||
@@ -3001,28 +3357,6 @@ static void ZbApp_UploadTask(void)
       ZbApp_StartTimer(ZbApp.upload_timer, 1000U);
     }
     return;
-  }
-
-  /* A raw FINAL ACK alone never releases the record. Summary must also ACK. */
-  if (ZbDeferred.active && ZbDeferred.confirmed)
-  {
-    if(!gateway_exchange.active || gateway_exchange.batch!=ZbDeferred.batch || !gateway_exchange.valid) {
-      ZbApp_StartTimer(ZbApp.upload_timer,100U);return;
-    }
-    if (!ZigbeeVibrationStore_Acknowledge(ZbDeferred.batch))
-      goto transfer_failed;
-    ZbApp_Log("ZIGBEE: batch=%lu raw/features confirmed; Flash record released\r\n",
-              (unsigned long)ZbDeferred.batch);
-    ZbApp_ClearDeferredUpload();
-    ZbVibrationUpload.phase = V2_TX_IDLE;
-    uint8_t pending[V2_BATCH_LEN];
-    if (!ZigbeeVibrationStore_Pending(pending))
-    {
-      ZbApp.upload_allowed = 0U;
-      ZbApp_StopUploadFastPoll();
-      ZbApp_FinishCollectionCycle(1U);
-      return;
-    }
   }
 
   if (ZbVibrationUpload.phase == V2_TX_ERROR) goto transfer_failed;
@@ -3044,26 +3378,15 @@ static void ZbApp_UploadTask(void)
 
   if (!ZbDeferred.active && ZbApp.upload_allowed)
   {
-    if(gateway_exchange.active && gateway_exchange.batch!=0U &&
-        (gateway_exchange.valid || gateway_scalar_cache_valid)) {
-      ZbApp_StartTimer(ZbApp.upload_timer,100U);return;
-    }
     uint8_t descriptor[V2_BATCH_LEN];
-    /* 已经宣告的批次优先完成；旧 Flash 积压留到后续轮次，不串用批次许可。 */
-    int found=gateway_exchange.active && gateway_exchange.batch ?
-        ZigbeeVibrationStore_DescribeBatch(gateway_exchange.batch,descriptor):
-        ZigbeeVibrationStore_Pending(descriptor);
-    if (!found)
+    if (!ZigbeeVibrationStore_Pending(descriptor))
     {
       ZbApp.upload_allowed=0U;
-      ZbApp_StopUploadFastPoll();
-      ZbApp_FinishCollectionCycle(1U);
       return;
     }
     ZbApp_ClearDeferredUpload();
     upload_generation++;
     ZbDeferred.batch=v2_u32(descriptor+1U);
-    ZbApp_GatewayBegin(ZbDeferred.batch);
     ZbDeferred.rate=v2_u16(descriptor+5U);
     ZbDeferred.count=v2_u32(descriptor+7U);
     ZbDeferred.expected_crc=v2_u32(descriptor+13U);
@@ -3078,7 +3401,6 @@ static void ZbApp_UploadTask(void)
     /* Features-only batches also request permission before bulk processing. */
     if(!v2_tx_start(&ZbVibrationUpload,descriptor,now)) goto transfer_failed;
     upload_lease_start(&upload_lease,ZbDeferred.batch,++upload_nonce,APP_ElapsedMs());
-    ZbApp_StartUploadFastPoll();
     logged_block=0U;
     ZbApp_Log("ZIGBEE: Flash batch=%lu points=%lu mode=%s\r\n",
               (unsigned long)ZbDeferred.batch,(unsigned long)ZbDeferred.count,
@@ -3090,7 +3412,7 @@ static void ZbApp_UploadTask(void)
   if(ZbDeferred.active && ZbVibrationUpload.phase!=V2_TX_BATCH && !ZbVibrationUpload.deferred && !ZbDeferred.confirmed) {
     if(upload_lease.lost) {
       ZbApp_Log("ZIGBEE: upload lease lost batch=%lu; raw stopped, Flash retained\r\n",(unsigned long)ZbDeferred.batch);
-      upload_health.pending=1;goto transfer_failed;
+      goto transfer_failed;
     }
     uint32_t lease_now=APP_ElapsedMs();
     uint8_t query[10];UploadLease saved=upload_lease;
@@ -3109,7 +3431,7 @@ static void ZbApp_UploadTask(void)
     int scalar_result=scalar_tx_poll(&ZbDeferred.scalars,&scalar_io,now);
     if(scalar_result<0) {
       ZbApp_Log("ZIGBEE: batch=%lu scalar verification failed; waveform retained\r\n",(unsigned long)ZbDeferred.batch);
-      if(ZbDeferred.scalars.attempts>=SCALAR_RETRIES)upload_health.pending=1;
+      /* Application verification failure alone is not missing radio ACKs. */
       goto transfer_failed;
     }
     if(!scalar_result) {
@@ -3142,7 +3464,6 @@ static void ZbApp_UploadTask(void)
   else if (v2_tx_active(&ZbVibrationUpload))
   {
     if (!ZbVibrationUpload.deferred || v2_due(now,ZbVibrationUpload.next_ms))
-      ZbApp_StartUploadFastPoll();
     now=HAL_GetTick();
     v2_tx_poll(&ZbVibrationUpload,&io,now);
     if(ZbVibrationUpload.index!=logged_block)
@@ -3165,7 +3486,7 @@ static void ZbApp_UploadTask(void)
     }
     if(v2_due(now,ZbDeferred.deadline))
     {
-      if(ZbDeferred.tries>=V2_RETRIES) {upload_health.pending=1;goto transfer_failed;}
+      if(ZbDeferred.tries>=V2_RETRIES) goto transfer_failed;
       Custom_APP_ZigbeeSnapshot_t summary;
       memset(&summary,0,sizeof(summary));
       summary.valid_mask=CUSTOM_APP_ZB_VALID_VIBRATION;
@@ -3191,11 +3512,10 @@ queue_sleep:
                      ZbUploadQueueDeadlineRtc-rtc_now : 1U;
       ZbUploadQueueSleeping = 1U;
       ZbUploadQueueWake = 0U;
-      ZbApp_StopUploadFastPoll();
+      ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_QUEUE);
       ZbApp_StartTimer(ZbApp.upload_timer,delay);
-      ZbApp_Log("ZIGBEE: upload queued batch=%lu wait=%lu ms; STOP2 still requires gateway permission\r\n",
+      ZbApp_Log("ZIGBEE: upload queued batch=%lu wait=%lu ms; STOP2 until the next upload request\r\n",
                 (unsigned long)ZbDeferred.batch,(unsigned long)delay);
-      if (!ZbApp.config_query_pending)ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
       Custom_APP_ZigbeeActivityChanged();
       return;
     }
@@ -3207,6 +3527,7 @@ queue_sleep:
 transfer_failed:
   {
     uint32_t failed_batch=ZbDeferred.batch ? ZbDeferred.batch : ZbApp.batch_id;
+    ZbApp_TraceDump(1);
     ZbApp_Log("ZIGBEE: raw/features transfer failed; Flash batch=%lu retained\r\n",
               (unsigned long)failed_batch);
     ZbApp_Log("ZIGBEE: V2 failure phase=%u block=%u retries=%u waits=%lu ack_timeouts=%lu aps_failures=%lu\r\n",
@@ -3214,21 +3535,103 @@ transfer_failed:
               (unsigned long)ZbVibrationUpload.wait_count,
               (unsigned long)ZbVibrationUpload.timeout_count,
               (unsigned long)ZbVibrationUpload.radio_failures);
-    if(ZbVibrationUpload.radio_failures || ZbVibrationUpload.timeout_count)upload_health.pending=1;
+    /* Flash/codec/resource errors, application rejection, lease loss and an
+     * earlier recovered radio error cannot promote a batch failure to link
+     * recovery. Only the filtered consecutive peer-ACK callbacks latch pending. */
     upload_generation++;memset(&upload_lease,0,sizeof(upload_lease));
     ZbUploadQueueSleeping=0U;
     ZbApp_ClearDeferredUpload();
     ZbVibrationUpload.phase=V2_TX_IDLE;
     ZbApp.upload_allowed=0U;
-    ZbApp_StopUploadFastPoll();
     ZbApp.monitor_state=ZB_MONITOR_ERROR;
     (void)ZbApp_SendMonitorStateForBatch(ZbApp.monitor_state,failed_batch);
     ZbApp.monitor_state=ZbApp.monitor_enabled ? ZB_MONITOR_WAITING : ZB_MONITOR_SLEEP;
     Custom_APP_ZigbeeActivityChanged();
+    if (network_authorized) post_upload_config_due=1U;
     if(upload_health.pending)ZbApp_StartTimer(ZbApp.upload_timer,1000U);
-    else if(ZbApp.monitor_enabled) ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
+    else if(post_upload_config_due) ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
     else ZbApp_ScheduleMonitorStandby();
   }
+}
+
+static void ZbApp_RuntimeRestoreCallback(enum ZbStatusCodeT status,void *arg)
+{
+  if((uint32_t)(uintptr_t)arg!=persist_restore_generation)return;
+  persist_restore_inflight=0U;ZbApp.restore_pending=0U;
+  /* A real Leave/removal during the asynchronous restore wins over recovery. */
+  if(!network_authorized || leave_cleanup_pending || ZbApp.join_blocked_until_reset)return;
+  ZbApp.parent_online=0U;ZbApp.parent_state_known=1U;
+  upload_health.backoff=status!=ZB_STATUS_SUCCESS;
+  upload_health.verifying=status!=ZB_STATUS_SUCCESS;
+  if(status==ZB_STATUS_SUCCESS) {
+    ZbApp.join_status=ZB_STATUS_SUCCESS;
+    ZbApp.rejoin_probe_pending=ZbApp.rejoin_probe_rtc=1U;
+    ZbApp.rtc_join_active=1U;ZbApp.rtc_join_attempts=0U;
+#if ((CFG_ZIGBEE_NVM_ENABLED != 0U) && (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U))
+    if(ZbApp.nvm_ready)ZbApp_EnablePersistence("runtime-restore");
+#endif
+    ZbApp_Log("ZIGBEE: runtime network restored; coordinator verification required\r\n");
+  } else {
+    upload_health.rounds=2U;
+    upload_health.deadline=APP_ElapsedMs()+UPLOAD_RECOVERY_BACKOFF_MS;
+    ZbApp.rejoin_via_startup=1U;
+    ZbApp_Log("ZIGBEE: runtime restore failed status=0x%02x; credentials/Flash retained, retry after 60 s\r\n",status);
+  }
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
+}
+
+/* Reset APS/NWK only, leaving BLE, sensor policy and external Flash intact.
+ * Save the CURRENT security counters first; never roll back to an older blob.
+ * No reset may overlap a startup, persistence command or an owned TX buffer. */
+static int ZbApp_RestartSavedNetwork(void)
+{
+#if ((CFG_ZIGBEE_NVM_ENABLED != 0U) && (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U))
+  if(!network_authorized || !ZbApp.nvm_ready || leave_cleanup_pending ||
+     ZbApp.join_blocked_until_reset)return -1;
+  if(ZbApp.startup_wait_active || ZbApp.restore_pending || persist_restore_inflight || ZbApp.radio_exclusive ||
+     ZbApp.persist_tx_hold || APP_ZIGBEE_IsTransmitting() || ZbSamplingCapture ||
+     ZbApp.audio_waiting)return 0;
+  for(unsigned i=0;i<3;i++)if(ZbUploadSlots[i].busy)return 0;
+  ZbApp.startup_wait_active=1U;
+  ZbApp_Log("ZIGBEE-PERSIST: source=before-runtime-reset; saving current network state\r\n");
+  if(!ZbApp_PersistSave()) {
+    ZbApp.startup_wait_active=0U;
+    ZbApp_Log("ZIGBEE: runtime reset deferred: current network snapshot unavailable\r\n");
+    return -1;
+  }
+  if(!network_authorized || leave_cleanup_pending || ZbApp.join_blocked_until_reset ||
+     ZbApp.radio_exclusive) {ZbApp.startup_wait_active=0U;return -1;}
+  ZbApp_StopConfigTransaction();PendingLink_Stop();
+  if(ZbApp.join_retry_timer!=0xFFU)HW_TS_Stop(ZbApp.join_retry_timer);
+  if(ZbApp.report_timer!=0xFFU)HW_TS_Stop(ZbApp.report_timer);
+  if(ZbApp.persist_timer!=0xFFU)HW_TS_Stop(ZbApp.persist_timer);
+  ZbApp.persist_save_pending=ZbApp.persist_tx_hold=ZbApp.config_query_pending=0U;
+  ZbApp_ResetTxQueue();upload_generation++;memset(&upload_lease,0,sizeof(upload_lease));
+  ZbApp_ClearDeferredUpload();ZbVibrationUpload.phase=V2_TX_IDLE;
+  ZbApp.upload_allowed=0U;ZbUploadQueueSleeping=0U;
+  ZbApp.parent_sync_pending=ZbApp.rejoin_probe_pending=ZbApp.rejoin_probe_rtc=0U;
+  ZbApp.rtc_join_active=ZbApp.rtc_join_attempts=ZbApp.restore_recovery_active=0U;
+  hy_zdo_inflight=hy_parent_response=recovery_announce_pending=0U;
+  ZbApp.parent_online=0U;ZbApp.parent_state_known=1U;
+  UTIL_LPM_SetStopMode(1U<<CFG_LPM_APP_ZIGBEE,UTIL_LPM_DISABLE);
+  ZbReset(ZbApp.zb);ZbApp_SetMaximumTxPower();
+  upload_health.restarted=1U;upload_health.restart_at=APP_ElapsedMs();
+  upload_health.rounds=upload_health.backoff=upload_health.verifying=0U;
+  ZbApp.restore_pending=1U;
+  ++persist_restore_generation;persist_restore_request_generation=persist_restore_generation;
+  persist_restore_inflight=1U;
+  ZbApp_Log("ZIGBEE: runtime APS/NWK reset; restoring current saved network, BLE/policy/Flash retained\r\n");
+  enum ZbStatusCodeT status=ZbStartupPersist(ZbApp.zb,
+      &ZbPersistCache.bytes[ZB_PERSIST_DATA_OFFSET],ZbPersistCache.words[0],NULL,
+      ZbApp_RuntimeRestoreCallback,(void *)(uintptr_t)persist_restore_generation);
+  ZbApp.startup_wait_active=0U;
+  UTIL_LPM_SetStopMode(1U<<CFG_LPM_APP_ZIGBEE,UTIL_LPM_ENABLE);
+  if(status!=ZB_STATUS_SUCCESS)
+    ZbApp_RuntimeRestoreCallback(status,(void *)(uintptr_t)persist_restore_generation);
+  return 1;
+#else
+  return -1;
+#endif
 }
 
 /* Run in the sequencer, never in an APS callback. Probe first; retain network
@@ -3237,69 +3640,72 @@ static uint8_t ZbApp_ServiceUploadRecovery(void)
 {
   if(!upload_health.pending)return 0;
   uint32_t now=APP_ElapsedMs();
-  if(ZbApp.radio_exclusive || ZbApp.persist_tx_hold || ZbApp.restore_pending) {
+  if(ZbApp.radio_exclusive || ZbApp.persist_tx_hold || ZbApp.restore_pending ||
+     ZbApp.startup_wait_active) {
+    ZbApp_StartTimer(ZbApp.upload_timer,1000U);return 1;
+  }
+  if(upload_health.verifying && APP_ZIGBEE_IsConnected() && !ZbApp.rtc_join_active &&
+     !ZbApp.restore_recovery_active && !recovery_announce_pending) {
+    memset(&upload_health,0,sizeof(upload_health));ZbApp.upload_allowed=1;
+    ZbApp_RequireSamplingSchedule();recovery_config_pending=1U;
+    UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    ZbApp_Log("ZIGBEE: upload link recovered; reapplying for oldest Flash batch\r\n");
+    ZbApp_StartTimer(ZbApp.upload_timer,100U);
+    return 1;
+  }
+  if(upload_health.backoff) {
+    if((int32_t)(now-upload_health.deadline)>=0) {
+      if(upload_health.rounds>=2U && (!upload_health.restarted ||
+          (uint32_t)(now-upload_health.restart_at)>=UPLOAD_RECOVERY_RESTART_MS)) {
+        int restarted=ZbApp_RestartSavedNetwork();
+        if(restarted<=0) {
+          if(restarted<0)upload_health.deadline=now+UPLOAD_RECOVERY_BACKOFF_MS;
+          ZbApp_StartTimer(ZbApp.upload_timer,1000U);return 1;
+        }
+      } else {
+        upload_health.backoff=0U;
+        ZbApp_StartLinkRecovery();upload_health.deadline=now+15000U;
+      }
+    }
     ZbApp_StartTimer(ZbApp.upload_timer,1000U);return 1;
   }
   if(!upload_health.verifying) {
+    ZbApp_TraceDump(2);
     upload_health.verifying=1;upload_health.deadline=now+10000U;
+    if (network_authorized) post_upload_config_due=1U;
     upload_generation++;memset(&upload_lease,0,sizeof(upload_lease));
     ZbApp_ClearDeferredUpload();ZbVibrationUpload.phase=V2_TX_IDLE;
-    ZbUploadQueueSleeping=0;ZbApp.upload_allowed=0;ZbApp_StopUploadFastPoll();
+    ZbUploadQueueSleeping=0;ZbApp.upload_allowed=0;
     ZbApp_ResetTxQueue();
     ZbApp.parent_online=0;ZbApp.parent_state_known=1;
     ZbApp_Log("ZIGBEE: upload link suspect; bulk paused, verifying parent; NVM/Flash retained\r\n");
     ZbApp_VerifyParent();
-  } else if(APP_ZIGBEE_IsConnected() && !ZbApp.rtc_join_active &&
-            !ZbApp.restore_recovery_active && !recovery_announce_pending) {
-    memset(&upload_health,0,sizeof(upload_health));
-    ZbApp.upload_allowed=1;
-    ZbApp_Log("ZIGBEE: upload link recovered; reapplying for oldest Flash batch\r\n");
-    return 0;
   } else if((int32_t)(now-upload_health.deadline)>=0) {
-    ZbApp_ResetTxQueue(); /* Retire late probe/summary callbacks before another attempt. */
+    /* Cancel the whole expired probe, not just its callback. Otherwise the
+     * retired callback can never clear rejoin_probe_pending/rtc_join_active,
+     * and every subsequent StartLinkRecovery silently returns forever. The
+     * synchronous startup helper must have returned before cancelling. */
+    ZbApp_Log("ZIGBEE: recovery probe timeout; retiring round rtc=%u attempts=%u probe=%u parent=%u\r\n",
+              (unsigned)ZbApp.rtc_join_active,(unsigned)ZbApp.rtc_join_attempts,
+              (unsigned)ZbApp.rejoin_probe_pending,(unsigned)ZbApp.parent_sync_pending);
+    if(ZbApp.join_retry_timer!=0xFFU)HW_TS_Stop(ZbApp.join_retry_timer);
+    ZbApp_ResetTxQueue();
     ZbApp.parent_sync_pending=0;
-    ZbApp_Log("ZIGBEE: parent verification/recovery still unavailable; secure recovery, retry in 15 s\r\n");
-    ZbApp_StartLinkRecovery();upload_health.deadline=now+15000U;
+    ZbApp.rejoin_probe_pending=ZbApp.rejoin_probe_rtc=0;
+    ZbApp.rtc_join_active=ZbApp.rtc_join_attempts=0;
+    hy_zdo_inflight=hy_parent_response=0;
+    ZbApp_CompleteJoinFailureCycle();
   }
   ZbApp_StartTimer(ZbApp.upload_timer,1000U);return 1;
 }
 
 static void ZbApp_StartConfigTransaction(void)
 {
-  if (ZbApp.zb) {
-    uint16_t period=250U;
-    (void)ZbNwkSet(ZbApp.zb,ZB_NWK_NIB_ID_FastPollPeriod,&period,sizeof(period));
-  }
-  if ((ZbConfigFastPoll != NULL) || (ZbApp.zb == NULL))
-  {
-    return;
-  }
-  ZbConfigFastPoll = ZbNwkFastPollRequest(
-      ZbApp.zb, ZB_NWK_SYNC_DEFAULT_DELAY_MS, 0U);
-  if (ZbConfigFastPoll != NULL)
-  {
-    UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_DISABLE);
-  }
-  else
-  {
-    ZbApp_Log("ZIGBEE: configuration transaction fast-poll request failed\r\n");
-  }
+  UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_DISABLE);
 }
 
 static void ZbApp_StopConfigTransaction(void)
 {
-  if (ZbConfigFastPoll != NULL)
-  {
-    if (ZbApp.zb != NULL)
-    {
-      (void)ZbNwkFastPollRelease(ZbApp.zb, ZbConfigFastPoll);
-    }
-    ZbConfigFastPoll = NULL;
-  }
-  if (ZbApp.zb) {
-    uint16_t period=250U;
-    (void)ZbNwkSet(ZbApp.zb,ZB_NWK_NIB_ID_FastPollPeriod,&period,sizeof(period));
-  }
   if (network_authorized != 0U)
   {
     UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_ENABLE);
@@ -3309,8 +3715,9 @@ static void ZbApp_StopConfigTransaction(void)
 
 static void ZbApp_OpenControlWindow(uint8_t reason)
 {
+  if (reason==ZB_CONFIG_QUERY_COLLECTION) post_upload_config_due=1U;
   if (ZbApp.restore_pending || ZbApp.restore_recovery_active || recovery_announce_pending) {
-    if (reason == ZB_CONFIG_QUERY_JOIN) recovery_config_pending=1U;
+    if (reason != ZB_CONFIG_QUERY_IDLE) recovery_config_pending=1U;
     return;
   }
   if (!coordinator_endpoint) {
@@ -3318,10 +3725,18 @@ static void ZbApp_OpenControlWindow(uint8_t reason)
     return;
   }
   if (!APP_ZIGBEE_IsConnected()) {
-    if (reason == ZB_CONFIG_QUERY_COLLECTION) ZbApp_ScheduleNextReport();
-    else ZbApp_ScheduleMonitorStandby();
+    if (reason == ZB_CONFIG_QUERY_COLLECTION) {
+      recovery_config_pending=1U;
+      ZbApp_ScheduleNextReport();
+    } else ZbApp_ScheduleMonitorStandby();
     return;
   }
+  if (reason==ZB_CONFIG_QUERY_COLLECTION && !sampling_resume_pending && network_authorized) {
+    if (!gateway_exchange.active) ZbApp_BeginGatewayExchange(0U,NULL);
+    else UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    return;
+  }
+  if (reason==ZB_CONFIG_QUERY_JOIN) ZbApp_RequireSamplingSchedule();
   /* Open a receive window and advertise current state. No 0x99 request and
    * no repeated full-configuration exchange when the saved state matches. */
   ZbApp.config_query_pending=1U;
@@ -3340,11 +3755,7 @@ static void ZbApp_FinishCollectionCycle(uint8_t success)
   ZbApp.monitor_state = (ZbApp.monitor_enabled != 0U) ?
                         ZB_MONITOR_WAITING : ZB_MONITOR_SLEEP;
   Custom_APP_ZigbeeActivityChanged();
-  if(gateway_exchange.active)return; /* 明确许可取代“窗口超时就休眠”。 */
-  if (ZbApp.monitor_enabled != 0U)
-  {
-    ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
-  }
+  if (network_authorized) ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_COLLECTION);
   else ZbApp_ScheduleMonitorStandby();
 }
 
@@ -3363,6 +3774,10 @@ static void ZbApp_CommandConfirm(struct ZbZclCommandRspT *response, void *arg)
   if (was_parent_verification != 0U)
   {
     ZbApp.parent_sync_pending = 0U;
+    /* A completed probe is progress: leave time for the normal five-second
+     * retry before the upload watchdog starts another recovery round. */
+    if (upload_health.pending && upload_health.verifying)
+      upload_health.deadline = APP_ElapsedMs() + 15000U;
   }
   if (candidate_probe != 0U)
   {
@@ -3509,7 +3924,7 @@ static void ZbApp_CommandConfirm(struct ZbZclCommandRspT *response, void *arg)
      (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U))
       if (ZbApp.nvm_ready != 0U)
       {
-        ZbApp_SchedulePersistSave(ZB_PERSIST_SAVE_DELAY_MS);
+        ZbApp_SchedulePersistSave(ZB_PERSIST_SAVE_DELAY_MS, "rejoin-confirmed");
       }
 #endif
     }
@@ -3525,9 +3940,7 @@ static void ZbApp_CommandConfirm(struct ZbZclCommandRspT *response, void *arg)
   }
   if ((defer_join == 0U) && (APP_ZIGBEE_IsTransmitting() == 0U))
   {
-    ZbApp_Log(APP_ZIGBEE_WaitingGateway() ?
-        "ZIGBEE: transmission drained; waiting for gateway permission/settings\r\n" :
-        "ZIGBEE: transmission drained; application power locks decide STOP2\r\n");
+    ZbApp_Log("ZIGBEE: transmission complete; STOP2 allowed\r\n");
   }
   Custom_APP_ZigbeeActivityChanged();
   if (ZbApp.radio_control_deferred != 0U)
@@ -3539,6 +3952,7 @@ static void ZbApp_CommandConfirm(struct ZbZclCommandRspT *response, void *arg)
 
 static void ZbApp_ResetTxQueue(void)
 {
+  if (!PendingLink_Eligible()) PendingLink_Stop();
   command_confirm_generation = (command_confirm_generation + 1U) & 0x00FFFFFFU;
   uint8_t was_busy = APP_ZIGBEE_IsTransmitting();
 
@@ -3569,59 +3983,236 @@ static void ZbApp_SendPendingSnapshot(void)
   ZbApp.pending_snapshot_valid = 0U;
 }
 
-/* 只释放旧监测待机窗口的锁；网关、采集和 BLE 等锁仍按各自条件管理。 */
-static void ZbApp_ReleaseMonitorStandbyLock(void)
-{
-  monitor_standby_enabled(&monitor_standby);
-  UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY,UTIL_LPM_ENABLE);
-}
-
 static uint8_t ZbApp_ApplyMonitorSwitch(uint8_t flags)
 {
   uint8_t previous=ZbApp.monitor_enabled;
   if (flags & ZB_CONFIG_FLAG_MONITOR_PRESENT) {
     ZbApp.monitor_enabled=(flags & ZB_CONFIG_FLAG_MONITOR_ENABLED)!=0U;
     if (!ZbApp.monitor_enabled) {
+      /* In manual-admission mode an explicit OFF policy means the gateway
+       * has not authorized this member. Its old NVM marker must not let it
+       * enter standby after the gateway database was replaced/reinitialized. */
+      if(network_authorized) {
+        network_authorized=0U;
+#if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
+        (void)ZbApp_NvmWriteAuthorization();
+#endif
+      }
+      UTIL_LPM_SetStopMode(1U<<CFG_LPM_NODE_ADMISSION,UTIL_LPM_DISABLE);
+      sampling_resume_pending=0U;
       sampling_cadence.active=0; sampling_due=0;
       if (sampling_timer!=0xFFU) HW_TS_Stop(sampling_timer);
       ZbApp.monitor_state=ZB_MONITOR_SLEEP;
-    } else {
-      /* 重复启用也清理遗留锁，但不能重置正在采集/上传的监测状态。 */
-      ZbApp_ReleaseMonitorStandbyLock();
-      if(!previous)ZbApp.monitor_state=ZB_MONITOR_WAITING;
+    } else if (!previous) {
+      if(!network_authorized) {
+        /* First user admission starts a new cycle immediately. Saved-node
+         * reconnects retain the existing gateway sampling-deadline plan. */
+        sampling_resume_pending=0U;sampling_cadence.active=0U;sampling_due=0U;
+      }
+      monitor_standby_enabled(&monitor_standby);
+      UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY,UTIL_LPM_ENABLE);
+      ZbApp.monitor_state=ZB_MONITOR_WAITING;
     }
   }
   return previous;
 }
 
+static void ZbApp_BeginGatewayExchange(uint32_t batch,const Custom_APP_ZigbeeSnapshot_t *snapshot)
+{
+  ZbApp_WakeSleepRadio();
+  if (gateway_exchange.active) return;
+  if (!gateway_exchange.token) gateway_exchange.token=ZbApp.batch_id;
+  if (!++gateway_exchange.token) ++gateway_exchange.token;
+  gateway_exchange.batch=batch;
+  gateway_exchange.revision=0U;
+  gateway_exchange.decision=0U;
+  gateway_exchange.final_valid=0U;
+  gateway_exchange.advertised=gateway_exchange.commands=gateway_exchange.permit=0U;
+  gateway_exchange.sleep_persist_requested=0U;
+  gateway_exchange.rejected=gateway_exchange.save_error=0U;
+  gateway_exchange.scalar=snapshot!=NULL;
+  if (snapshot && snapshot!=&gateway_exchange.snapshot) gateway_exchange.snapshot=*snapshot;
+  gateway_exchange.probe_at=APP_ElapsedMs()+10000U;
+  gateway_exchange.active=1U;
+  post_upload_config_due=1U;
+  ZbApp.config_query_pending=0U;
+  UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,UTIL_LPM_DISABLE);
+  ZbApp_StartConfigTransaction();
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+}
+
+static void ZbApp_CloseGatewayExchange(void)
+{
+  if (!gateway_exchange.active) return;
+  gateway_exchange.active=0U;
+  if (ZbApp.report_timer!=0xFFU) HW_TS_Stop(ZbApp.report_timer);
+  UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,UTIL_LPM_ENABLE);
+  ZbApp_StopConfigTransaction();
+}
+
+static void ZbApp_CompleteGatewayCommand(uint8_t result)
+{
+  gateway_exchange.command_result=result;
+  gateway_exchange.final_valid=1U;
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+}
+
+static void ZbApp_ServiceGatewayExchange(void)
+{
+  if (ZbApp.radio_exclusive || ZbApp.radio_paused) return;
+  if (!APP_ZIGBEE_IsConnected() || ZbApp.rtc_join_active) {
+    ZbApp_StartLinkRecovery();
+    ZbApp_StartTimer(ZbApp.report_timer,2000U);
+    return;
+  }
+  if (ZbApp.audio_waiting || ZbSamplingCapture || ZbApp.tx_count || ZbApp.tx_in_flight ||
+      ZbApp.persist_tx_hold || ZbApp.persist_save_pending || hy_zdo_inflight ||
+      ZbUploadSlots[0].busy || ZbUploadSlots[1].busy || ZbUploadSlots[2].busy) {
+    ZbApp_StartTimer(ZbApp.report_timer,100U);
+    return;
+  }
+
+  uint32_t batch=gateway_exchange.batch;
+  if (gateway_exchange.rejected && batch) {
+    uint8_t scalar=gateway_exchange.scalar;
+    ZbApp_CloseGatewayExchange();
+    if (scalar) {
+      ZbApp_SendSnapshot(&gateway_exchange.snapshot,batch);
+      ZbApp_BeginGatewayExchange(batch,&gateway_exchange.snapshot);
+    } else {
+      upload_generation++;
+      memset(&upload_lease,0,sizeof(upload_lease));
+      ZbApp_ClearDeferredUpload();
+      ZbVibrationUpload.phase=V2_TX_IDLE;
+      ZbApp.upload_allowed=1U;
+      ZbApp_StartTimer(ZbApp.upload_timer,3000U);
+    }
+    return;
+  }
+  if (gateway_exchange.permit && !ZbApp.channel_migration_wait) {
+#if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
+    if (ZbApp.nvm_ready && !gateway_exchange.sleep_persist_requested) {
+      /* The exchange lock stays held until the persistence task clears pending. */
+      gateway_exchange.sleep_persist_requested=1U;
+      ZbApp_RecordPersistRequest("pre-sleep", 0U);
+      ZbApp_Log("ZIGBEE: pre-sleep network save requested batch=%lu\r\n",(unsigned long)batch);
+      UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_PERSIST, CFG_SCH_PRIO_1);
+      ZbApp_StartTimer(ZbApp.report_timer,100U);
+      return;
+    }
+#endif
+    if (batch && !gateway_exchange.scalar) {
+      int released=ZbDeferred.active && ZbDeferred.batch==batch ?
+          ZbApp_ReleaseConfirmedBatch() : ZigbeeVibrationStore_Acknowledge(batch);
+      if (released<=0) {
+        ZbApp_StartTimer(ZbApp.report_timer,1000U);
+        return;
+      }
+      uint8_t pending[V2_BATCH_LEN];
+      ZbApp.upload_allowed=ZigbeeVibrationStore_Pending(pending);
+      if (!ZbApp.upload_allowed) {
+        (void)ZbApp_SendMonitorStateForBatch(ZB_MONITOR_COMPLETE,batch);
+        ZbApp.monitor_state=ZbApp.monitor_enabled ? ZB_MONITOR_WAITING : ZB_MONITOR_SLEEP;
+      }
+    }
+    ZbApp_CloseGatewayExchange();
+    post_upload_config_due=0U;
+    ZbApp_Log("ZIGBEE: gateway permits sleep batch=%lu\r\n",(unsigned long)batch);
+    if (ZbApp.monitor_enabled) {
+      ZbApp_ScheduleNextReport();
+      if (!sampling_due && !ZbApp.upload_allowed && !sampling_resume_pending &&
+          sampling_cadence.active && sampling_timer != 0xFFU)
+        ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_SAMPLING);
+    } else ZbApp_ScheduleMonitorStandby();
+    if (sampling_due) UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    if (ZbApp.upload_allowed)
+      UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
+    Custom_APP_ZigbeeActivityChanged();
+    return;
+  }
+
+  uint32_t now=APP_ElapsedMs();
+  if ((int32_t)(now-gateway_exchange.probe_at)>=0) {
+    gateway_exchange.probe_at=now+10000U;
+    ZbApp_VerifyParent();
+  }
+  if (gateway_exchange.final_valid) {
+    uint8_t final[GX_HEADER+GX_SAMPLING_RESULT_SIZE];
+    gx_header(final,GX_RESPONSE,GX_SAMPLING,gateway_exchange.command_seq,GX_SAMPLING_RESULT_SIZE);
+    uint8_t *body=final+GX_HEADER;
+    gx_put32(body,gateway_exchange.token);
+    gx_put32(body+4,batch);
+    body[8]=gateway_exchange.command_result;
+    gx_put32(body+9,gateway_exchange.revision);
+    (void)ZbApp_SendCommand(GX_CONTROL,final,sizeof(final));
+    ZbApp_StartTimer(ZbApp.report_timer,2000U);
+    return;
+  }
+
+  uint8_t frame[GX_HEADER+GX_CONTEXT_SIZE+GX_SCALAR_SIZE]={0};
+  uint8_t *p=frame+GX_HEADER;
+  gx_put32(p,gateway_exchange.token);
+  gx_put32(p+4,batch);
+  gx_put32(p+8,gateway_exchange.revision);
+  gx_put32(p+12,applied_config_hash);
+  p[16]=GX_CONTEXT_FINAL | (gateway_exchange.commands ? GX_CONTEXT_COMMANDS : 0U);
+  unsigned size=GX_CONTEXT_SIZE;
+  if (gateway_exchange.scalar) {
+    const Custom_APP_ZigbeeSnapshot_t *snap=&gateway_exchange.snapshot;
+    uint8_t *manifest=p+GX_CONTEXT_SIZE;
+    manifest[0]=V2_VERSION;
+    gx_put32(manifest+1,batch);
+    manifest[5]=SCALAR_POLICY_VERSION;
+    manifest[6]=snap->scalar_required_mask;
+    manifest[7]=snap->valid_mask&SCALAR_ALL;
+    for (unsigned item=0;item<4;item++) {
+      uint8_t value[10];
+      if (ZbApp_ScalarPacket(snap,batch,item,value))
+        gx_put32(manifest+8+4U*item,scalar_value_crc(item,value));
+    }
+    p[16]|=GX_CONTEXT_SCALAR;
+    size+=GX_SCALAR_SIZE;
+  }
+  gx_header(frame,GX_EVENT,GX_CONTEXT,0U,(uint16_t)size);
+  if (ZbApp_SendCommand(GX_DATA,frame,(uint16_t)(GX_HEADER+size))==ZCL_STATUS_SUCCESS) {
+    gx_header(frame,GX_EVENT,GX_READY,0U,GX_READY_SIZE);
+    p[12]=0U;
+    if (ZbApp_SendCommand(GX_DATA,frame,GX_HEADER+GX_READY_SIZE)==ZCL_STATUS_SUCCESS)
+      gateway_exchange.advertised=1U;
+  }
+  ZbApp_StartTimer(ZbApp.report_timer,2000U);
+}
+
 static uint8_t ZbApp_ServiceControlWindow(void)
 {
   if (!ZbApp.config_query_pending || ZbApp.config_query_attempts!=1U) return 0U;
+  if (ZbApp.config_query_reason==ZB_CONFIG_QUERY_COLLECTION &&
+      (ZbApp.tx_count || ZbApp.tx_in_flight)) {
+    ZbApp.config_query_attempts=0U;
+    ZbApp_StartTimer(ZbApp.report_timer,100U);
+    return 1U;
+  }
   ZbApp.config_query_attempts=2U;
   recovery_config_pending=0U; /* Coalesce a HELLO with this same status window. */
   ZbApp_SendLinkStatus(0U);
-  ZbApp_StartTimer(ZbApp.report_timer,8000U);
+  ZbApp_StartTimer(ZbApp.report_timer,CONTROL_RECEIVE_WINDOW_MS);
   return 1U;
 }
 
-static enum ZclStatusCodeT ZbApp_SendLinkStatus(uint8_t applied)
+static void ZbApp_SendLinkStatus(uint8_t applied)
 {
   if (!APP_ZIGBEE_IsConnected() || !coordinator_endpoint || ZbApp.radio_exclusive ||
       ZbApp.restore_pending || ZbApp.restore_recovery_active || recovery_announce_pending)
-    return ZCL_STATUS_FAILURE;
-  ZbApp_GatewayBegin(0U);
-  uint8_t payload[CONTROL_FINAL_SIZE]={CONTROL_STATUS_VERSION,0};
+    return;
+  uint8_t payload[CONTROL_STATUS_SIZE]={CONTROL_STATUS_VERSION,0};
   payload[1]=(ZbApp.config_valid?CONTROL_VALID:0U) |
-             (ZbApp.monitor_enabled?CONTROL_ENABLED:0U) | (applied==1U?CONTROL_APPLIED:0U) | (applied==2U?CONTROL_SAVE_FAILED:0U);
+             (ZbApp.monitor_enabled?CONTROL_ENABLED:0U) | (applied?CONTROL_APPLIED:0U) | (sampling_resume_pending?CONTROL_NEEDS_SCHEDULE:0U);
   for (unsigned i=0;i<4;i++) payload[2+i]=(uint8_t)(applied_config_hash>>(8U*i));
   payload[6]=ZCL_BASIC_POWER_DC; payload[7]=ZbApp.monitor_state;
-  Comm_WriteU32(payload+CONTROL_STATUS_SIZE,gateway_exchange.revision);
-  enum ZclStatusCodeT submitted=ZbApp_SendCommand(CONTROL_STATUS_CMD,payload,
-      applied?CONTROL_FINAL_SIZE:CONTROL_STATUS_SIZE);
+  enum ZclStatusCodeT submitted=ZbApp_SendCommand(CONTROL_STATUS_CMD,payload,sizeof(payload));
   ZbApp_Log("ZIGBEE: %s status queued rc=%02x hash=%08lx monitor=%u state=%u\r\n",
-            applied==1U?"applied":(applied==2U?"save-failed":"link"),(unsigned int)submitted,(unsigned long)applied_config_hash,
+            applied?"applied":"link",(unsigned int)submitted,(unsigned long)applied_config_hash,
             ZbApp.monitor_enabled,ZbApp.monitor_state);
-  return submitted;
 }
 
 static enum ZclStatusCodeT ZbApp_SendMonitorState(uint8_t state)
@@ -3645,7 +4236,15 @@ static enum ZclStatusCodeT ZbApp_SendMonitorStateForBatch(uint8_t state,
 
 static void ZbApp_ScheduleMonitorStandby(void)
 {
-  if (!network_authorized || ZbApp.monitor_enabled || ZbApp.config_query_pending) return;
+  if(ZbApp.monitor_enabled || ZbApp.config_query_pending)return;
+  if(!network_authorized) {
+    if(APP_ZIGBEE_IsConnected()) {
+      UTIL_LPM_SetStopMode(1U<<CFG_LPM_NODE_ADMISSION,UTIL_LPM_DISABLE);
+      PendingLink_Start();
+      /* The gateway schedules link-quality probes for pending nodes. */
+    }
+    return;
+  }
   if(ZbUploadQueueSleeping) {
     UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY,UTIL_LPM_ENABLE);
     Custom_APP_ZigbeeActivityChanged();
@@ -3659,21 +4258,65 @@ static void ZbApp_ScheduleMonitorStandby(void)
   uint32_t delay = monitor_standby_delay(&monitor_standby, now, &awake);
   if (awake) {
     ZbApp_StartConfigTransaction();
-    uint16_t period=1000U;
-    (void)ZbNwkSet(ZbApp.zb,ZB_NWK_NIB_ID_FastPollPeriod,&period,sizeof(period));
     UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY, UTIL_LPM_DISABLE);
   } else {
     ZbApp_StopConfigTransaction();
+    if (ZbApp.report_timer != 0xFFU)
+      ZbApp_RequestRadioSleep(ZB_RADIO_SLEEP_STANDBY);
     UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY, UTIL_LPM_ENABLE);
-    ZbApp_Log("ZIGBEE: monitoring off; gateway_wait=%u next status in %lu ms\r\n",
-        APP_ZIGBEE_WaitingGateway(),(unsigned long)delay);
+    ZbApp_Log("ZIGBEE: monitoring off; preparing STOP2, next status in %lu ms\r\n",(unsigned long)delay);
   }
   ZbApp_StartTimer(ZbApp.report_timer, delay);
   Custom_APP_ZigbeeActivityChanged();
 }
 
+static uint8_t ZbApp_ApplySamplingDeadline(uint32_t epoch,uint32_t delay)
+{
+  uint32_t period=ZbApp.monitor_config.auto_interval_sec*1000U;
+  if (!ZbApp.monitor_enabled || !sampling_resume_pending) return 0U;
+  sampling_cadence_resume(&sampling_cadence,APP_ElapsedMs(),period,delay);
+  sampling_due=0U;sampling_resume_pending=0U;
+  ZbApp_ArmSamplingTimer();
+  ZbApp_Log("ZIGBEE: recovery sampling scheduled epoch=%lu delay=%lu ms next_rtc=%lu; cached batches may upload first\r\n",
+      (unsigned long)epoch,(unsigned long)delay,(unsigned long)sampling_cadence.next);
+  return 1U;
+}
+
+static void ZbApp_ResumeCachedUpload(void)
+{
+  if (!APP_ZIGBEE_IsConnected()) return;
+  ZbApp_SendPendingSnapshot();
+  uint8_t descriptor[V2_BATCH_LEN];
+  if (!ZbApp.upload_allowed && !ZigbeeVibrationStore_Pending(descriptor)) return;
+  ZbApp.upload_allowed=1U;
+  UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
+}
+
+static uint8_t ZbApp_WaitForSamplingDeadline(uint8_t sampling_wake)
+{
+  if (ZbApp.audio_waiting || ZbSamplingCapture || sampling_wake ||
+      (!sampling_resume_pending && (!sampling_cadence.active ||
+       (int32_t)(APP_ElapsedMs()-sampling_cadence.next)>=0))) return 0U;
+  if (sampling_resume_pending && !ZbApp.config_query_pending)
+    ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_JOIN);
+  else if (!sampling_resume_pending) ZbApp_ArmSamplingTimer();
+  ZbApp_ResumeCachedUpload();
+  return 1U;
+}
+
+static void ZbApp_RequireSamplingSchedule(void)
+{
+  sampling_resume_pending=1U;sampling_due=0U;
+  if(sampling_timer!=0xFFU)HW_TS_Stop(sampling_timer);
+}
+
 static void ZbApp_ScheduleNextReport(void)
 {
+  if (sampling_resume_pending) {
+    if (network_authorized && !ZbApp.config_query_pending)
+      ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_JOIN);
+    return;
+  }
   if (ZbApp.radio_exclusive != 0U)
   {
     return;
@@ -3689,19 +4332,21 @@ static void ZbApp_ScheduleNextReport(void)
 
 static void ZbApp_ArmSamplingTimer(void)
 {
-  if (sampling_cadence.active && ZbApp.monitor_enabled)
+  if (sampling_cadence.active && ZbApp.monitor_enabled && !sampling_resume_pending)
     ZbApp_StartTimer(sampling_timer,sampling_cadence_delay(&sampling_cadence,APP_ElapsedMs()));
 }
 
 static void ZbApp_SamplingTimerCallback(void)
 {
-  if (!sampling_cadence.active || !ZbApp.monitor_enabled) return;
+  if (!sampling_cadence.active || !ZbApp.monitor_enabled || sampling_resume_pending) return;
   sampling_due=1U;
+  ZbApp_WakeSleepRadio();
   UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_REPORT, CFG_SCH_PRIO_1);
 }
 
 static void ZbApp_StartAutonomousReporting(void)
 {
+  ZbApp_RequireSamplingSchedule();
   ZbApp.reporting_active = 1U;
   ZbApp.monitor_enabled = 0U;
   ZbApp.monitor_state = ZB_MONITOR_SLEEP;
@@ -3711,7 +4356,7 @@ static void ZbApp_StartAutonomousReporting(void)
     ZbApp_Log("ZIGBEE: restored network; configuration deferred until coordinator verification and announcement\r\n");
     return;
   }
-  ZbApp_Log("ZIGBEE: joined/restored; awaiting gateway configuration push\r\n");
+  ZbApp_Log("ZIGBEE: joined/restored; awaiting authorization or next sampling time\r\n");
   if (ZbApp.radio_exclusive == 0U)
   {
     ZbApp_OpenControlWindow(ZB_CONFIG_QUERY_JOIN);
@@ -3721,7 +4366,6 @@ static void ZbApp_StartAutonomousReporting(void)
 static void ZbApp_AnnounceTask(void)
 {
   struct ZbZdoDeviceAnnceT announcement;
-  struct nwk_fastpoll_entry_t *poll_handle = NULL;
   uint8_t capability = MCP_ASSOC_CAP_ALLOC_ADDR;
   uint16_t local_pan_id = 0xFFFFU;
   uint16_t local_manager_address = 0U;
@@ -3766,27 +4410,7 @@ static void ZbApp_AnnounceTask(void)
               (unsigned long)local_ext_pan_id);
   }
 
-  /* Membership verification has its own bounded budget. Accepted nodes
-   * only need a short fast-poll window around their announcement. */
-  if (network_authorized == 0U)
-  {
-    ZbApp_StartAdmissionFastPoll();
-  }
-  else
-  {
-    poll_handle = ZbNwkFastPollRequest(ZbApp.zb,
-                                       ZB_NWK_SYNC_DEFAULT_DELAY_MS,
-                                       ZB_COMMISSIONING_FAST_POLL_MS);
-    if (poll_handle == NULL)
-    {
-      ZbApp_Log("ZIGBEE: commissioning fast-poll request failed\r\n");
-    }
-    else
-    {
-      ZbApp_Log("ZIGBEE: commissioning fast-poll active for %lu ms\r\n",
-                (unsigned long)ZB_COMMISSIONING_FAST_POLL_MS);
-    }
-  }
+  if (!network_authorized) PendingLink_Start();
   if (ZbApp.manual_announce_required != 0U)
   {
     memset(&announcement, 0, sizeof(announcement));
@@ -3852,6 +4476,12 @@ static void ZbApp_JoinRetryTimerCallback(void)
 
 static void ZbApp_ReportTimerCallback(void)
 {
+  if (radio_sleep.reason == ZB_RADIO_SLEEP_STANDBY)
+    ZbApp_WakeSleepRadio();
+  if (gateway_exchange.active && !sampling_resume_pending) {
+    UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    return;
+  }
   if (ZbApp.config_query_pending) {
     if (!ZbApp.config_query_attempts) {
       /* Submit from the sequencer, never from a timer callback. */
@@ -3869,9 +4499,9 @@ static void ZbApp_ReportTimerCallback(void)
     uint8_t reason=ZbApp.config_query_reason;
     ZbApp.config_query_pending=0U;
     ZbApp_StopConfigTransaction();
-    if (reason==ZB_CONFIG_QUERY_JOIN && !ZbApp.config_valid)
-      ZbApp_Log("ZIGBEE: initial push not received; collection remains disabled\r\n");
-    if (ZbApp.monitor_enabled) ZbApp_ScheduleNextReport();
+    if (reason==ZB_CONFIG_QUERY_COLLECTION && !sampling_resume_pending) post_upload_config_due=0U;
+    if (ZbApp.monitor_enabled || (sampling_resume_pending && network_authorized))
+      ZbApp_ScheduleNextReport();
     else ZbApp_ScheduleMonitorStandby();
     return;
   }
@@ -3883,6 +4513,7 @@ static void ZbApp_UploadTimerCallback(void)
   if (ZbUploadQueueSleeping != 0U)
   {
     ZbUploadQueueWake=1U; /* state machine is resumed in the sequencer task */
+    ZbApp_WakeSleepRadio();
   }
   UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_UPLOAD, CFG_SCH_PRIO_0);
 }
@@ -3908,6 +4539,10 @@ static void ZbApp_SetParentOnline(uint8_t online, enum ZbStatusCodeT status)
   ZbApp.parent_state_known = 1U;
   if (online != 0U)
   {
+    if (ZbApp.config_valid && ZbApp.monitor_enabled) {
+      ZbApp_RequireSamplingSchedule();recovery_config_pending=1U;
+      UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_REPORT,CFG_SCH_PRIO_1);
+    }
     if (admission_phase == 1U && admission_expired == 0U) {
       HW_TS_Stop(admission_timer_id);
       admission_phase = 0U;
@@ -3938,6 +4573,7 @@ static void ZbApp_SetParentOnline(uint8_t online, enum ZbStatusCodeT status)
   }
   else
   {
+    if (pending_link.active) PendingLink_Stop();
     ZbApp_Log("ZIGBEE: coordinator link offline status=0x%02x\r\n",
               (unsigned int)status);
   }
@@ -3954,6 +4590,7 @@ static uint8_t ZbApp_IsTrustedCoordinator(const struct ZbApsdeDataIndT *data_ind
 
 static void ZbApp_StartLinkRecovery(void)
 {
+  if(upload_health.pending && upload_health.backoff)return;
   if ((ZbApp.radio_exclusive != 0U) ||
       (ZbApp.restore_pending != 0U) ||
       (ZbApp.rtc_join_active != 0U) ||
@@ -3982,6 +4619,7 @@ static void ZbApp_StartLinkRecovery(void)
 
 static void ZbApp_VerifyParent(void)
 {
+  if(upload_health.pending && upload_health.backoff)return;
   if (ZbApp.restore_pending) return;
   /* Restore always verifies through ZDO, even if an early HELLO has already
    * advertised a private endpoint. Discovery must not own this proof. */
@@ -3990,13 +4628,14 @@ static void ZbApp_VerifyParent(void)
         !ZbApp.zb || ZbApp.join_status!=ZB_STATUS_SUCCESS || ZbApp.join_blocked_until_reset) return;
     struct ZbZdoNodeDescReqT req={.dstNwkAddr=0U,.nwkAddrOfInterest=0U};
     ZbApp.parent_sync_pending=hy_zdo_inflight=1U;
-    (void)ZbNwkFastPollRequest(ZbApp.zb,250U,10000U);
     enum ZbStatusCodeT result=ZbZdoNodeDescReq(ZbApp.zb,&req,ZbApp_ParentDescriptor,
         (void *)(uintptr_t)command_confirm_generation);
     if(result!=ZB_STATUS_SUCCESS) {
       ZbApp.parent_sync_pending=hy_zdo_inflight=0U;
       ZbApp_StartTimer(ZbApp.join_retry_timer,ZB_JOIN_RETRY_MS);
     }
+    else if(upload_health.pending && upload_health.verifying)
+      upload_health.deadline=APP_ElapsedMs()+10000U;
     return;
   }
   enum ZclStatusCodeT status;
@@ -4014,6 +4653,10 @@ static void ZbApp_VerifyParent(void)
   status = ZbApp_SendMonitorState(ZB_MONITOR_WAITING);
   if (status == ZCL_STATUS_SUCCESS)
   {
+    /* Each new candidate gets its own full response budget. A deadline from
+     * the previous attempt must not cancel this probe after only 2-3 seconds. */
+    if(upload_health.pending && upload_health.verifying)
+      upload_health.deadline=APP_ElapsedMs()+10000U;
     ZbApp_Log("ZIGBEE: coordinator link verification queued\r\n");
   }
   else
@@ -4027,13 +4670,6 @@ static void ZbApp_VerifyParent(void)
 static void ZbApp_PrepareFreshJoin(void)
 {
   coordinator_endpoint=0U;
-  protocol_peer_enabled=0U;
-  if(gateway_exchange.active) {
-    uint32_t batch=gateway_exchange.batch;
-    gateway_exchange.active=0U;ZbApp_GatewayBegin(batch);
-  }
-  gateway_fast_poll=NULL; /* 此路径随后重置 CPU2，旧句柄不能继续使用。 */
-  Comm_SetSession(COMM_LINK_ZIGBEE,command_confirm_generation);
   recovery_announce_pending=0U;
   if (ZbApp.zb == NULL)
   {
@@ -4089,6 +4725,16 @@ static void ZbApp_CompleteJoinFailureCycle(void)
 {
   ZbApp.rtc_join_active = 0U;
   ZbApp.rtc_join_attempts = 0U;
+  if(upload_health.pending && upload_health.verifying) {
+    if(upload_health.rounds<255U)upload_health.rounds++;
+    upload_health.backoff=1U;
+    upload_health.deadline=APP_ElapsedMs()+UPLOAD_RECOVERY_BACKOFF_MS;
+    ZbApp_ResetTxQueue();
+    ZbApp_Log("ZIGBEE: upload recovery round=%u exhausted; backoff 60 s, NVM/Flash retained\r\n",
+              upload_health.rounds);
+    ZbApp_StartTimer(ZbApp.upload_timer,1000U);
+    return;
+  }
   if ((ZbApp.upload_allowed != 0U) || v2_tx_active(&ZbVibrationUpload))
   {
     ZbApp.upload_allowed = 0U;
@@ -4107,6 +4753,17 @@ static void ZbApp_CompleteJoinFailureCycle(void)
   {
     ZbApp_Log("ZIGBEE: pending snapshot retained; next retry in 60 s\r\n");
     ZbApp_ScheduleNextReport();
+    return;
+  }
+
+  if (!network_authorized && ZbApp.join_status == ZB_STATUS_SUCCESS &&
+      !ZbApp.join_blocked_until_reset)
+  {
+    /* A pending node still belongs to the saved network. Retry with backoff
+     * instead of entering the offline acquisition path. */
+    ZbApp.rtc_join_active = 1U;
+    ZbApp_StartTimer(ZbApp.join_retry_timer, 60000U);
+    ZbApp_Log("PENDING-LINK: secure rejoin attempts exhausted; retry in 60 s\r\n");
     return;
   }
 
@@ -4188,9 +4845,11 @@ static enum zb_msg_filter_rc ZbApp_LeaveFilter(struct ZigBeeT *zb,
     memset(ZbUploadSlots, 0, sizeof(ZbUploadSlots));
     ZigbeeVibrationStore_Abort();
     leave_cleanup_pending = 1U;
+    ZbApp_WakeSleepRadio();
     ZbApp.collection_requested = 0U;
     ZbApp.audio_waiting = 0U;
-    recovery_config_pending = recovery_token_valid = 0U;
+    ZbApp_CloseGatewayExchange();
+    recovery_config_pending = recovery_token_valid = post_upload_config_due = 0U;
     ZbApp_ResetTxQueue();
 #if (ZB_SLEEPY_PERSIST_AUTOSAVE_ENABLED != 0U)
     if (ZbApp.persist_timer != 0xFFU)
@@ -4203,6 +4862,99 @@ static enum zb_msg_filter_rc ZbApp_LeaveFilter(struct ZigBeeT *zb,
     ZbApp_Log("ZIGBEE: leave received; network erase and fresh commissioning queued\r\n");
   }
   return ZB_MSG_CONTINUE;
+}
+
+static ZbMonitorConfig_t ZbApp_DecodeSampling(const uint8_t *payload, uint16_t length)
+{
+  return (ZbMonitorConfig_t){
+    v2_u32(payload), v2_u16(payload+4), v2_u16(payload+6), v2_u16(payload+8),
+    v2_u32(payload+10), v2_u16(payload+14), v2_u16(payload+16), v2_u16(payload+18),
+    length>=26U ? v2_u16(payload+20) : 1U, length>=26U ? v2_u32(payload+22) : 0U,
+    length>=29U ? payload[28] : CUSTOM_APP_ZB_SENSOR_ALL
+  };
+}
+
+static void ZbApp_EncodeLocalSampling(const ZbMonitorConfig_t *config, uint8_t payload[29])
+{
+  v2_w32(payload,config->auto_interval_sec);
+  v2_w16(payload+4,config->poll_interval_sec);
+  v2_w16(payload+6,config->vibration_rate_hz);
+  v2_w16(payload+8,config->digital_mic_rate_hz);
+  v2_w32(payload+10,config->analog_mic_rate_hz);
+  v2_w16(payload+14,config->vibration_window_ms);
+  v2_w16(payload+16,config->digital_mic_window_ms);
+  v2_w16(payload+18,config->analog_mic_window_ms);
+  v2_w16(payload+20,config->raw_upload_every_cycles);
+  v2_w32(payload+22,config->raw_upload_generation);
+  payload[26]=ZB_CONFIG_FLAG_MONITOR_PRESENT|ZB_CONFIG_FLAG_MONITOR_ENABLED;
+  payload[27]=0U;
+  payload[28]=config->sensor_enable_mask;
+}
+
+/* Two independent EEPROM records follow the existing network image. Commit
+ * the checksum last so a reset during an update leaves the prior slot usable. */
+#define ZB_SAMPLING_NVM_SLOT_WORDS 10U
+#define ZB_SAMPLING_NVM_TAG 0x53414d31UL
+
+static bool ZbApp_ReadLocalSamplingSlot(unsigned slot, uint32_t record[10])
+{
+  uint16_t base=(uint16_t)(CFG_ZIGBEE_NETWORK_NVM_WORDS+slot*ZB_SAMPLING_NVM_SLOT_WORDS);
+  for (unsigned i=0;i<ZB_SAMPLING_NVM_SLOT_WORDS;i++)
+    if (EE_Read(0,(uint16_t)(base+i),&record[i])!=EE_OK) return false;
+  return record[0]!=0U && record[9]==
+      (control_fingerprint((const uint8_t *)record,9U*sizeof(record[0]))^ZB_SAMPLING_NVM_TAG);
+}
+
+static bool ZbApp_SaveLocalSampling(const ZbMonitorConfig_t *config)
+{
+  uint32_t record[ZB_SAMPLING_NVM_SLOT_WORDS]={0};
+  uint8_t *payload=(uint8_t *)(record+1);
+  ZbApp_EncodeLocalSampling(config,payload);
+  uint32_t hash=control_fingerprint(payload,CONTROL_CONFIG_SIZE);
+  uint32_t readback[ZB_SAMPLING_NVM_SLOT_WORDS];
+  if (sampling_nvm_revision && sampling_nvm_hash==hash &&
+      ZbApp_ReadLocalSamplingSlot(sampling_nvm_revision&1U,readback) &&
+      readback[0]==sampling_nvm_revision &&
+      !memcmp(readback+1,record+1,CONTROL_CONFIG_SIZE)) return true;
+  record[0]=sampling_nvm_revision+1U;
+  if (!record[0]) record[0]=2U; /* Use the opposite slot even across wrap. */
+  record[9]=control_fingerprint((const uint8_t *)record,9U*sizeof(record[0]))^ZB_SAMPLING_NVM_TAG;
+  uint16_t base=(uint16_t)(CFG_ZIGBEE_NETWORK_NVM_WORDS+(record[0]&1U)*ZB_SAMPLING_NVM_SLOT_WORDS);
+  for (unsigned i=0;i<ZB_SAMPLING_NVM_SLOT_WORDS;i++) {
+    int status=EE_Write(0,(uint16_t)(base+i),record[i]);
+    if (status==EE_CLEAN_NEEDED) status=EE_Clean(0,0);
+    if (status!=EE_OK) return false;
+  }
+  if (!ZbApp_ReadLocalSamplingSlot(record[0]&1U,readback) ||
+      memcmp(record,readback,sizeof(record))) return false;
+  sampling_nvm_revision=record[0];
+  sampling_nvm_hash=hash;
+  return true;
+}
+
+static void ZbApp_LoadLocalSampling(void)
+{
+  uint32_t first[ZB_SAMPLING_NVM_SLOT_WORDS],second[ZB_SAMPLING_NVM_SLOT_WORDS];
+  bool first_valid=ZbApp.nvm_ready && ZbApp_ReadLocalSamplingSlot(0U,first);
+  bool second_valid=ZbApp.nvm_ready && ZbApp_ReadLocalSamplingSlot(1U,second);
+  const uint32_t *record=second_valid && (!first_valid || (int32_t)(second[0]-first[0])>0)
+      ? second : first_valid ? first : NULL;
+  if (record) {
+    const uint8_t *payload=(const uint8_t *)(record+1);
+    ZbApp.monitor_config=ZbApp_DecodeSampling(payload,CONTROL_CONFIG_SIZE);
+    sampling_nvm_revision=record[0];
+    sampling_nvm_hash=control_fingerprint(payload,CONTROL_CONFIG_SIZE);
+  } else {
+    ZbApp.monitor_config=(ZbMonitorConfig_t)ZB_DEFAULT_SAMPLING_CONFIG;
+    uint8_t payload[CONTROL_CONFIG_SIZE];
+    ZbApp_EncodeLocalSampling(&ZbApp.monitor_config,payload);
+    sampling_nvm_revision=0U;
+    sampling_nvm_hash=control_fingerprint(payload,sizeof(payload));
+    if (ZbApp.nvm_ready && !ZbApp_SaveLocalSampling(&ZbApp.monitor_config))
+      ZbApp_Log("ZIGBEE: could not save default sampling policy; using built-in values\r\n");
+  }
+  applied_config_hash=sampling_nvm_hash;
+  ZbApp.config_valid=1U;
 }
 
 static bool ZbApp_NvmInit(void)
@@ -4295,9 +5047,6 @@ static bool ZbApp_NvmRead(void)
   }
   ZbPersistCache.words[2] = authorization;
   network_authorized = authorization == ZB_PERSIST_AUTHORIZED ? 1U : 0U;
-  if(network_authorized && gateway_loaded_valid) {
-    ZbApp.config_valid=1U;ZbApp.monitor_enabled=gateway_loaded_enabled;
-  }
   ZbApp_Log("ZIGBEE: persisted authorization=%s\r\n",
             network_authorized != 0U ? "authorized" : "pending");
   return true;
@@ -4357,13 +5106,9 @@ static bool ZbApp_NvmWriteAuthorization(void)
 
 static void ZbApp_NvmErase(void)
 {
-  /* This task runs outside the CPU2 message-filter callback, so it is safe
-   * to release the stack-owned fast-poll handle here. */
-  ZbApp_StopAdmissionFastPoll();
+  /* Clean up in task context after the CPU2 leave notification returns. */
+  PendingLink_Stop();
   ZbApp_StopConfigTransaction();
-  if(gateway_fast_poll && ZbApp.zb) {
-    (void)ZbNwkFastPollRelease(ZbApp.zb,gateway_fast_poll);gateway_fast_poll=NULL;
-  }
   UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_ZIGBEE, UTIL_LPM_DISABLE);
   Custom_APP_ZigbeeAbortSnapshot();
 #if (CFG_ZIGBEE_NVM_ENABLED != 0U)
@@ -4410,16 +5155,9 @@ static void ZbApp_NvmErase(void)
   leave_cleanup_pending = 0U;
   network_authorized = 0U;
   monitor_standby = (MonitorStandby){0};
+  UTIL_LPM_SetStopMode(1U<<CFG_LPM_NODE_ADMISSION,UTIL_LPM_ENABLE);
   monitor_standby.random = ZbApp.batch_id ^ HAL_GetUIDw0();
   applied_config_hash=0U;
-  uint32_t gateway_backup_writable=PWR->CR1 & PWR_CR1_DBP;
-  HAL_PWR_EnableBkUpAccess();
-  HAL_RTCEx_BKUPWrite(&hrtc,RTC_BKP_DR0,0U);
-  if(!gateway_backup_writable)HAL_PWR_DisableBkUpAccess();
-  gateway_loaded_valid=gateway_loaded_enabled=0U;
-  memset(&gateway_exchange,0,sizeof(gateway_exchange));gateway_settings_dirty=0;
-  gateway_mode_save_failed=gateway_scalar_cache_valid=gateway_legacy_reply_pending=0U;
-  UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,UTIL_LPM_ENABLE);
   UTIL_LPM_SetStopMode(1U << CFG_LPM_MONITOR_STANDBY, UTIL_LPM_ENABLE);
   ZbApp.config_valid = ZbApp.monitor_enabled = ZbApp.reporting_active = 0U;
   ZbApp.pending_snapshot_valid = ZbApp.report_has_summary_confirm = 0U;
@@ -4427,8 +5165,9 @@ static void ZbApp_NvmErase(void)
   ZbApp.persist_save_pending = ZbApp.persist_tx_hold = 0U;
   memset(&ZbApp.pending_snapshot, 0, sizeof(ZbApp.pending_snapshot));
   memset(&ZbPersistCache, 0, sizeof(ZbPersistCache));
-  ZbApp.monitor_config = (ZbMonitorConfig_t){300U, 5U, 26667U, 46875U, 256000U,
-      500U, 1000U, 1000U, 1U, 0U, CUSTOM_APP_ZB_SENSOR_ALL};
+  sampling_nvm_revision=0U;
+  sampling_nvm_hash=0U;
+  ZbApp_LoadLocalSampling();
   ZbApp.security_join_cleanup_pending = 0U;
   network_persist_format_v2 = 0U;
   ZbApp.join_blocked_until_reset = 0U;
@@ -4494,12 +5233,29 @@ done:
   return saved;
 }
 
-static void ZbApp_SchedulePersistSave(uint32_t delay_ms)
+static struct {
+  const char *source;
+  uint32_t requested_ms, delay_ms, first_cpu2_ms, last_cpu2_ms, cpu2_count;
+  uint8_t waited_for_activity, waited_for_tx;
+} persist_diagnostics;
+
+static void ZbApp_RecordPersistRequest(const char *source, uint32_t delay_ms)
+{
+  if (ZbApp.persist_save_pending == 0U) {
+    memset(&persist_diagnostics, 0, sizeof(persist_diagnostics));
+    persist_diagnostics.source = source;
+    persist_diagnostics.requested_ms = APP_ElapsedMs();
+    persist_diagnostics.delay_ms = delay_ms;
+    ZbApp.persist_save_pending = 1U;
+  }
+}
+
+static void ZbApp_SchedulePersistSave(uint32_t delay_ms, const char *source)
 {
   if (leave_cleanup_pending != 0U) return;
   /* Repeated notifications must not postpone an already scheduled save. */
   if (ZbApp.persist_save_pending != 0U) return;
-  ZbApp.persist_save_pending = 1U;
+  ZbApp_RecordPersistRequest(source, delay_ms);
   if (ZbApp.persist_timer != 0xFFU)
   {
     ZbApp_StartTimer(ZbApp.persist_timer, delay_ms);
@@ -4518,15 +5274,22 @@ static void ZbApp_PersistNotify(struct ZigBeeT *zb, void *arg)
   UNUSED(arg);
   if (leave_cleanup_pending != 0U) return;
   /* CPU2 callback: no synchronous stack commands or flash operations here. */
-  ZbApp.persist_save_pending = 1U;
+  ZbApp_RecordPersistRequest("cpu2", 0U);
+  uint32_t now = APP_ElapsedMs();
+  if (persist_diagnostics.cpu2_count++ == 0U)
+    persist_diagnostics.first_cpu2_ms = now;
+  persist_diagnostics.last_cpu2_ms = now;
   UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_PERSIST, CFG_SCH_PRIO_1);
 }
 
-static void ZbApp_EnablePersistence(void)
+static void ZbApp_EnablePersistence(const char *source)
 {
   bool registered = ZbPersistNotifyRegister(ZbApp.zb, ZbApp_PersistNotify, NULL);
   ZbApp_Log("ZIGBEE: stack persistence notifications registered=%u\r\n", registered ? 1U : 0U);
-  ZbApp_PersistNotify(ZbApp.zb, NULL);
+  if (leave_cleanup_pending == 0U) {
+    ZbApp_RecordPersistRequest(source, 0U);
+    UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_PERSIST, CFG_SCH_PRIO_1);
+  }
 }
 
 static void ZbApp_PersistTask(void)
@@ -4550,6 +5313,7 @@ static void ZbApp_PersistTask(void)
       (ZbApp.audio_waiting != 0U) ||
       (ZbApp.monitor_state == ZB_MONITOR_CAPTURING))
   {
+    persist_diagnostics.waited_for_activity = 1U;
     ZbApp_StartTimer(ZbApp.persist_timer, ZB_PERSIST_RETRY_DELAY_MS);
     return;
   }
@@ -4558,15 +5322,29 @@ static void ZbApp_PersistTask(void)
   ZbApp.persist_tx_hold = 1U;
   if (ZbApp.tx_in_flight != 0U)
   {
+    persist_diagnostics.waited_for_tx = 1U;
     ZbApp_StartTimer(ZbApp.persist_timer, ZB_PERSIST_SAVE_DELAY_MS);
     return;
   }
 
+  __typeof__(persist_diagnostics) request = persist_diagnostics;
   ZbApp.persist_save_pending = 0U;
-  if (!ZbApp_PersistSave())
+  uint32_t started_ms = APP_ElapsedMs();
+  bool saved = ZbApp_PersistSave();
+  uint32_t finished_ms = APP_ElapsedMs();
+  ZbApp_Log("ZIGBEE-PERSIST: source=%s request_ms=%lu scheduled_delay_ms=%lu start_ms=%lu wait_ms=%lu save_ms=%lu ok=%u waited_activity=%u waited_tx=%u\r\n",
+      request.source, (unsigned long)request.requested_ms, (unsigned long)request.delay_ms,
+      (unsigned long)started_ms, (unsigned long)(started_ms-request.requested_ms),
+      (unsigned long)(finished_ms-started_ms), (unsigned)saved,
+      (unsigned)request.waited_for_activity, (unsigned)request.waited_for_tx);
+  if (request.cpu2_count != 0U)
+    ZbApp_Log("ZIGBEE-PERSIST: cpu2_notifications=%lu first_cpu2_ms=%lu last_cpu2_ms=%lu\r\n",
+        (unsigned long)request.cpu2_count, (unsigned long)request.first_cpu2_ms,
+        (unsigned long)request.last_cpu2_ms);
+  if (!saved)
   {
     ZbApp_Log("ZIGBEE: persistence save deferred for retry\r\n");
-    ZbApp_SchedulePersistSave(ZB_PERSIST_SAVE_DELAY_MS);
+    ZbApp_SchedulePersistSave(ZB_PERSIST_SAVE_DELAY_MS, "save-retry");
   }
   ZbApp.persist_tx_hold = 0U;
   UTIL_SEQ_SetTask((1U << CFG_TASK_ZIGBEE_TX) | (1U << CFG_TASK_ZIGBEE_UPLOAD), CFG_SCH_PRIO_0);
@@ -4646,6 +5424,7 @@ static void ZbApp_PersistRestoreCallback(enum ZbStatusCodeT status, void *arg)
     ZbApp_Log("ZIGBEE: restored-parent verification window started (%lu ms)\r\n",
               (unsigned long)ZB_RESTORED_PARENT_VERIFY_MS);
     ZbApp.join_status = ZB_STATUS_SUCCESS;
+    ZbApp_ReadReceiveMode();
     recovery_token_valid = 0U;
     recovery_config_pending = 0U;
     recovery_retry_count = 0U;
@@ -4678,7 +5457,7 @@ static void ZbApp_PersistRestoreCallback(enum ZbStatusCodeT status, void *arg)
        Repeatedly restoring the same old blob can reuse a counter window. */
     if (ZbApp.nvm_ready != 0U)
     {
-      ZbApp_EnablePersistence();
+      ZbApp_EnablePersistence("startup-restore");
       ZbApp_Log("ZIGBEE: post-restore network-state refresh scheduled\r\n");
     }
 #else
@@ -4769,18 +5548,22 @@ enum ZbStatusCodeT ZbStartupWait(struct ZigBeeT *zb, struct ZbStartupT *config)
   ++startup_wait_generation;
   ZbApp_ReadSecurityDiagnostic(0U);
   info->status = ZB_STATUS_ALLOC_FAIL;
-  startup_operation_inflight = 1U;
   ZbApp_Log("ZIGBEE-DIAG: ZbStartup call gen=%lu control=%u restore_pending=%u startup_active=%u join=0x%02x phase=%u\r\n",
             (unsigned long)startup_wait_generation, (unsigned int)config->startupControl,
             (unsigned int)ZbApp.restore_pending, (unsigned int)ZbApp.startup_wait_active,
             (unsigned int)ZbApp.join_status, (unsigned int)admission_phase);
   ZbApp_SetMaximumTxPower();
+  startup_operation_inflight = 1U;
+  if (admission_expired) {
+    ZbApp_StartupOperationCompleted(startup_wait_generation);
+    return (enum ZbStatusCodeT)0xFF;
+  }
   status = ZbStartup(zb, config, ZbStartupWaitCb, (void *)(uintptr_t)startup_wait_generation);
   ZbApp_Log("ZIGBEE-DIAG: ZbStartup immediate status=0x%02x gen=%lu\r\n",
             (unsigned int)status, (unsigned long)startup_wait_generation);
   if (status != ZB_STATUS_SUCCESS)
   {
-    startup_operation_inflight = 0U;
+    ZbApp_StartupOperationCompleted(startup_wait_generation);
     return status;
   }
   UTIL_SEQ_WaitEvt(EVENT_ZIGBEE_STARTUP_ENDED);
@@ -4926,250 +5709,4 @@ static void APP_ZIGBEE_ProcessRequestM0ToM4(void)
     CptReceiveRequestFromM0 = 0U;
     Zigbee_M0RequestProcessing();
   }
-}
-
-/* Unified messages use the same A-version endpoint learning and trust checks.
- * Legacy 0x92..0x95/0x0D reliability remains owned by the upload state machine. */
-uint8_t APP_ZIGBEE_ProtocolReady(void)
-{
-  return APP_ZIGBEE_IsConnected() && coordinator_endpoint && !ZbApp.radio_exclusive &&
-      !ZbApp.restore_pending && !ZbApp.restore_recovery_active;
-}
-
-CommResult APP_ZIGBEE_ProtocolSend(const CommSource *source,const uint8_t *frame,uint16_t length)
-{
-  if(source->session!=command_confirm_generation || !APP_ZIGBEE_ProtocolReady())return COMM_NOT_READY;
-  if(length>COMM_ZB_FRAME_MAX)return COMM_BAD_LENGTH;
-  if(ZbApp.tx_count>=ZB_TX_QUEUE_DEPTH)return COMM_BUSY;
-  if(frame[1]==COMM_KIND_DATA && length>=COMM_HEADER_SIZE+4U &&
-      (frame[2]==COMM_DATA_SCALARS || frame[2]==COMM_DATA_WAVE || frame[2]==COMM_DATA_FEATURES)) {
-    uint32_t batch=Comm_ReadU32(frame+8);
-    if(gateway_exchange.active && gateway_exchange.batch && gateway_exchange.batch!=batch &&
-        !(gateway_exchange.valid && gateway_exchange.commands))return COMM_BUSY;
-    ZbApp_GatewayBegin(batch);
-  }
-  uint8_t command=frame[1]==COMM_KIND_RESPONSE ? COMM_ZB_CONTROL_COMMAND:COMM_ZB_DATA_COMMAND;
-  enum ZclStatusCodeT status=ZbApp_SendCommand(command,frame,length);
-  return status==ZCL_STATUS_SUCCESS?COMM_OK:
-      (status==ZCL_STATUS_INSUFFICIENT_SPACE?COMM_BUSY:COMM_NOT_READY);
-}
-
-uint32_t APP_ZIGBEE_ProtocolNextBatch(void)
-{
-  if(!++ZbApp.batch_id)++ZbApp.batch_id;
-  return ZbApp.batch_id;
-}
-
-CommResult APP_ZIGBEE_ProtocolSubmit(uint32_t batch,const Custom_APP_ZigbeeSnapshot_t *snapshot)
-{
-  if(snapshot->valid_mask & CUSTOM_APP_ZB_VALID_VIBRATION) {
-    if(!ZigbeeVibrationStore_SetRawPolicy(batch,1U) ||
-       !ZigbeeVibrationStore_SaveMetadata(batch,snapshot,sizeof(*snapshot)))return COMM_HARDWARE_ERROR;
-    ZbApp.upload_allowed=1U;
-    UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);
-    /* A's manifest/CRC/repair flow is unchanged. Publish the unified snapshot
-     * too; duplicates are identified by batch+TLV type at the receiver. */
-  }
-  ZbApp_SendSnapshot(snapshot,batch);
-  return COMM_OK;
-}
-
-/* 以下过程只在主循环/协作任务中运行，不在 APS/中断回调中操作备份寄存器或快轮询。 */
-static void ZbApp_GatewayBegin(uint32_t batch)
-{
-  uint32_t token=gateway_exchange.token;
-  gateway_begin(&gateway_exchange,batch);
-  if(token!=gateway_exchange.token)gateway_scalar_cache_valid=0U;
-  UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,UTIL_LPM_DISABLE);
-}
-static void ZbApp_GatewayChanged(void)
-{
-  if(!gateway_exchange.active)ZbApp_GatewayBegin(0U);
-  gateway_changed(&gateway_exchange);gateway_settings_dirty=1U;gateway_save_retry=0U;
-  gateway_legacy_reply_pending=1U;
-}
-static void ZbApp_CommonCommandDone(const CommRequest *request,CommResult result)
-{
-  if(request->source.link!=COMM_LINK_ZIGBEE)return;
-  if(!gateway_exchange.active)ZbApp_GatewayBegin(0U);
-  gateway_changed(&gateway_exchange);
-  if(result==COMM_OK && (request->code==COMM_CMD_WINDOW ||
-      request->code==COMM_CMD_DECIMATION)) {
-    gateway_settings_dirty=1U;gateway_save_retry=0U;
-  }
-  if(request->code==COMM_CMD_WORK_MODE_SET)
-    gateway_mode_save_failed=result==COMM_SAVE_FAILED;
-}
-/* 公共队列的提交钩子：响应成功意味着本条配置已经应用并保存校验。
- * RTC 操作在任务上下文完成；失败返回独立的 SAVE_FAILED，不把接收成功当配置成功。 */
-static CommResult ZbApp_FinalizeCommand(const CommRequest *request,CommResult result,uint32_t *revision)
-{
-  *revision=request->source.link==COMM_LINK_ZIGBEE?gateway_exchange.revision:0U;
-  if(result!=COMM_OK)return result;
-  /* 模式命令已在 DT_CommWorkMode 内完成 BKP19 写入/回读；不重复保存其他配置。 */
-  if(request->code==COMM_CMD_WINDOW || request->code==COMM_CMD_DECIMATION) {
-    gateway_settings_dirty=1U;
-    ZbApp_GatewaySaveSettings();
-    if(gateway_settings_dirty)return COMM_SAVE_FAILED;
-  }
-  return COMM_OK;
-}
-/* 只有最终响应提交后，网关才能以响应内的新 revision 给出最终许可。
- * 排队的后续命令已执行时，前一条响应不能宣布最新版本就绪。 */
-static void ZbApp_FinalResponseSubmitted(const CommRequest *request,CommResult result,uint32_t revision)
-{
-  (void)result;
-  if(request->source.link==COMM_LINK_ZIGBEE && gateway_exchange.active &&
-      revision!=COMM_REVISION_UNKNOWN && revision==gateway_exchange.revision) {
-    gateway_exchange.advertised=gateway_exchange.decision_seen;
-    gateway_exchange.response_ready=gateway_exchange.decision_seen;
-  }
-}
-uint8_t APP_ZIGBEE_WaitingGateway(void)
-{
-  return gateway_exchange.active || gateway_settings_dirty || gateway_mode_save_failed || gateway_legacy_reply_pending;
-}
-
-/* 业务配置使用 RTC BKP0..15，BKP19 继续留给模式配置。
- * 保存范围包括 Zigbee 采集参数、监测开关及公共窗口/抽取设置；写入后逐字回读。
- * STOP2 和备份域保电复位可保持。VDD/VBAT 同时掉电不保证保存，不宣称 Flash 持久化。
- * magic 最后提交；中途复位的半条记录不会被恢复。 */
-#define GATEWAY_SETTINGS_MAGIC 0x47574331UL
-static void ZbApp_GatewaySaveSettings(void)
-{
-  uint8_t bytes[64]={0},readback[64];
-  uint32_t revision=gateway_exchange.revision;
-  uint32_t was_writable=PWR->CR1 & PWR_CR1_DBP;
-  Comm_WriteU32(bytes,GATEWAY_SETTINGS_MAGIC);
-  Comm_WriteU32(bytes+4,ZbApp.monitor_config.auto_interval_sec);
-  Comm_WriteU16(bytes+8,ZbApp.monitor_config.poll_interval_sec);
-  Comm_WriteU16(bytes+10,ZbApp.monitor_config.vibration_rate_hz);
-  Comm_WriteU16(bytes+12,ZbApp.monitor_config.digital_mic_rate_hz);
-  Comm_WriteU32(bytes+14,ZbApp.monitor_config.analog_mic_rate_hz);
-  Comm_WriteU16(bytes+18,ZbApp.monitor_config.vibration_window_ms);
-  Comm_WriteU16(bytes+20,ZbApp.monitor_config.digital_mic_window_ms);
-  Comm_WriteU16(bytes+22,ZbApp.monitor_config.analog_mic_window_ms);
-  Comm_WriteU16(bytes+24,ZbApp.monitor_config.raw_upload_every_cycles);
-  Comm_WriteU32(bytes+26,ZbApp.monitor_config.raw_upload_generation);
-  bytes[30]=ZbApp.monitor_config.sensor_enable_mask;
-  bytes[31]=ZbApp.monitor_enabled;bytes[32]=ZbApp.config_valid;
-  Custom_APP_ProtocolExportSettings(bytes+33);
-  Comm_WriteU32(bytes+60,control_fingerprint(bytes,60));
-  HAL_PWR_EnableBkUpAccess();
-  HAL_RTCEx_BKUPWrite(&hrtc,RTC_BKP_DR0,0U);
-  for(unsigned i=1;i<16;i++)HAL_RTCEx_BKUPWrite(&hrtc,RTC_BKP_DR0+i,Comm_ReadU32(bytes+4*i));
-  HAL_RTCEx_BKUPWrite(&hrtc,RTC_BKP_DR0,GATEWAY_SETTINGS_MAGIC);
-  for(unsigned i=0;i<16;i++)Comm_WriteU32(readback+4*i,HAL_RTCEx_BKUPRead(&hrtc,RTC_BKP_DR0+i));
-  if(!was_writable)HAL_PWR_DisableBkUpAccess();
-  if(!memcmp(bytes,readback,sizeof(bytes)) && revision==gateway_exchange.revision)
-    gateway_settings_dirty=0U;
-  ZbApp_Log("ZIGBEE: settings backup verify=%u revision=%lu\r\n",!gateway_settings_dirty,(unsigned long)gateway_exchange.revision);
-}
-static void ZbApp_GatewayLoadSettings(void)
-{
-  uint8_t bytes[64];
-  for(unsigned i=0;i<16;i++)Comm_WriteU32(bytes+4*i,HAL_RTCEx_BKUPRead(&hrtc,RTC_BKP_DR0+i));
-  if(Comm_ReadU32(bytes)!=GATEWAY_SETTINGS_MAGIC ||
-      Comm_ReadU32(bytes+60)!=control_fingerprint(bytes,60) || bytes[31]>1 || bytes[32]>1 ||
-      Comm_ReadU32(bytes+4)<300U || Comm_ReadU32(bytes+4)>2147483U ||
-      !Comm_ReadU16(bytes+8) || Comm_ReadU16(bytes+10)!=26667U ||
-      Comm_ReadU16(bytes+12)!=46875U || Comm_ReadU32(bytes+14)!=256000U ||
-      !Comm_ReadU16(bytes+24) || (bytes[30]&~CUSTOM_APP_ZB_SENSOR_ALL) ||
-      !Custom_APP_ProtocolImportSettings(bytes+33))return;
-  ZbApp.monitor_config.auto_interval_sec=Comm_ReadU32(bytes+4);
-  ZbApp.monitor_config.poll_interval_sec=Comm_ReadU16(bytes+8);
-  ZbApp.monitor_config.vibration_rate_hz=Comm_ReadU16(bytes+10);
-  ZbApp.monitor_config.digital_mic_rate_hz=Comm_ReadU16(bytes+12);
-  ZbApp.monitor_config.analog_mic_rate_hz=Comm_ReadU32(bytes+14);
-  ZbApp.monitor_config.vibration_window_ms=Comm_ReadU16(bytes+18);
-  ZbApp.monitor_config.digital_mic_window_ms=Comm_ReadU16(bytes+20);
-  ZbApp.monitor_config.analog_mic_window_ms=Comm_ReadU16(bytes+22);
-  ZbApp.monitor_config.raw_upload_every_cycles=Comm_ReadU16(bytes+24);
-  ZbApp.monitor_config.raw_upload_generation=Comm_ReadU32(bytes+26);
-  ZbApp.monitor_config.sensor_enable_mask=bytes[30];
-  gateway_loaded_valid=bytes[32];gateway_loaded_enabled=bytes[31];
-  /* 恢复数值；仅在原网络授权恢复成功后，恢复监测启用状态。 */
-  ZbApp_Log("ZIGBEE: backed-up settings restored; network authorization still required\r\n");
-}
-
-void APP_ZIGBEE_GatewayProcess(void)
-{
-  uint32_t now=APP_ElapsedMs();
-  uint8_t capture=APP_ZIGBEE_IsMeasuring() || Custom_APP_ProtocolStreaming();
-  UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,
-      APP_ZIGBEE_WaitingGateway()?UTIL_LPM_DISABLE:UTIL_LPM_ENABLE);
-  /* 旧配置入口串行化：一次保存尝试后只回一条最终 A4 结果，不预先宣告 APPLIED。 */
-  if(gateway_legacy_reply_pending==1U && !capture && !Comm_HasPending()) {
-    ZbApp_GatewaySaveSettings();
-    gateway_legacy_reply_pending=gateway_settings_dirty?3U:2U;
-  }
-  if(gateway_legacy_reply_pending>=2U && APP_ZIGBEE_ProtocolReady()) {
-    uint8_t reply=gateway_legacy_reply_pending==2U?1U:2U;
-    if(ZbApp_SendLinkStatus(reply)==ZCL_STATUS_SUCCESS) {
-      gateway_legacy_reply_pending=0U;
-      gateway_exchange.advertised=gateway_exchange.decision_seen;
-      gateway_exchange.response_ready=gateway_exchange.decision_seen;
-    }
-  }
-  if(gateway_settings_dirty && !gateway_legacy_reply_pending && !capture && !Comm_HasPending() &&
-      (int32_t)(now-gateway_save_retry)>=0) {
-    gateway_save_retry=now+1000U;ZbApp_GatewaySaveSettings();
-  }
-  if(!gateway_exchange.active || !APP_ZIGBEE_ProtocolReady())return;
-  uint8_t radio_busy=ZbApp.tx_count || ZbApp.tx_in_flight || hy_zdo_inflight;
-  for(unsigned i=0;i<3;i++)radio_busy|=ZbUploadSlots[i].busy;
-  uint8_t data_busy=v2_tx_active(&ZbVibrationUpload) || (ZbDeferred.active && !ZbDeferred.confirmed) ||
-      (ZbApp.upload_allowed && !ZbDeferred.active && !gateway_scalar_cache_valid &&
-       (!gateway_exchange.valid || !gateway_exchange.batch));
-  uint8_t busy=capture || radio_busy || data_busy || Comm_HasPending() ||
-      ZbApp.persist_save_pending || ZbApp.persist_tx_hold || gateway_legacy_reply_pending;
-  /* 旧完整性确认之后，新增有效数据确认拒收仍可重传；拒收不释放 Flash。 */
-  if(gateway_exchange.rejected && !radio_busy && !capture && !Comm_HasPending()) {
-    uint8_t retained[V2_BATCH_LEN];
-    gateway_exchange.rejected=0U;
-    if(!gateway_exchange.commands && gateway_exchange.batch &&
-        ZigbeeVibrationStore_DescribeBatch(gateway_exchange.batch,retained)) {
-      uint32_t batch=gateway_exchange.batch;
-      upload_generation++;ZbApp_ClearDeferredUpload();ZbVibrationUpload.phase=V2_TX_IDLE;
-      gateway_exchange.active=0U;ZbApp_GatewayBegin(batch);
-      ZbApp.upload_allowed=1U;UTIL_SEQ_SetTask(1U<<CFG_TASK_ZIGBEE_UPLOAD,CFG_SCH_PRIO_0);return;
-    }
-    if(!gateway_exchange.commands && gateway_scalar_cache_valid) {
-      ZbApp_SendSnapshot(&gateway_scalar_cache,gateway_exchange.batch);return;
-    }
-  }
-  /* 已上传批次可以发送就绪，但必须等上传任务完成 Flash 确认/释放，才能结束轮次。 */
-  if(gateway_can_finish(&gateway_exchange,busy || ZbDeferred.active,
-      gateway_settings_dirty || gateway_mode_save_failed)) {
-    gateway_exchange.active=0U;gateway_exchange.commands=0U;
-    if(gateway_fast_poll) {
-      (void)ZbNwkFastPollRelease(ZbApp.zb,gateway_fast_poll);gateway_fast_poll=NULL;
-    }
-    ZbApp.config_query_pending=0U;
-    if(ZbApp.report_timer!=0xFFU)HW_TS_Stop(ZbApp.report_timer);
-    ZbApp_StopConfigTransaction();
-    /* 明确许可且本地工作完成后，两种监测状态都不应残留旧的十分钟待机锁。 */
-    ZbApp_ReleaseMonitorStandbyLock();
-    UTIL_LPM_SetStopMode(1U<<CFG_LPM_GATEWAY_EXCHANGE,UTIL_LPM_ENABLE);
-    ZbApp_Log("ZIGBEE: gateway permits sleep; data valid, commands drained, settings verified\r\n");
-    if(ZbApp.monitor_enabled)ZbApp_ScheduleNextReport();
-    else ZbApp_ScheduleMonitorStandby();
-    Custom_APP_ZigbeeActivityChanged();return;
-  }
-  if(busy)return;
-  if(!gateway_fast_poll) {
-    uint16_t period=250U;
-    (void)ZbNwkSet(ZbApp.zb,ZB_NWK_NIB_ID_FastPollPeriod,&period,sizeof(period));
-    gateway_fast_poll=ZbNwkFastPollRequest(ZbApp.zb,ZB_NWK_SYNC_DEFAULT_DELAY_MS,0U);
-  }
-  /* 配置最终响应已包含保存结果及命令版本，不再补发一条保存就绪事件。 */
-  if(gateway_exchange.response_ready)return;
-  if((int32_t)(now-gateway_exchange.next)<0)return;
-  uint8_t payload[COMM_GATEWAY_REPORT_SIZE];
-  Comm_WriteU32(payload,gateway_exchange.token);Comm_WriteU32(payload+4,gateway_exchange.batch);
-  Comm_WriteU32(payload+8,gateway_exchange.revision);
-  payload[12]=(gateway_settings_dirty || gateway_mode_save_failed)?COMM_HARDWARE_ERROR:COMM_OK;
-  if(Comm_Send(COMM_LINK_ZIGBEE,COMM_KIND_EVENT,COMM_DATA_GATEWAY_EXCHANGE,payload,sizeof(payload))==COMM_OK) {
-    gateway_exchange.advertised=1U;gateway_exchange.next=now+2000U;
-  } else gateway_exchange.next=now+100U;
 }

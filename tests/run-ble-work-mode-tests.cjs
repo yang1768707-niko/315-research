@@ -25,7 +25,7 @@ if(!cc&&cp.spawnSync('gcc',['--version']).status===0)cc='gcc';
 const originalGcc='F:/WorkAPP/QT/Tools/mingw1310_64/bin/gcc.exe';
 if(!cc&&fs.existsSync(originalGcc))cc=originalGcc;
 if(cc) {
- run(cc,['-std=c11','-Wall','-Wextra','-Werror','-I'+out,'-I'+path.join(root,'Core/Inc'),
+ run(cc,[...JSON.parse(process.env.NATIVE_CC_ARGS||'[]'),'-std=c11','-Wall','-Wextra','-Werror','-I'+out,'-I'+path.join(root,'Core/Inc'),
    path.join(__dirname,'test_ble_work_mode.c'),path.join(root,'Core/Src/comm_protocol.c'),'-o',exe]);
 } else {
  const lcc=process.env.LCC_ROOT||'D:/Program Files/MATLAB/R2024b/sys/lcc64/lcc64';

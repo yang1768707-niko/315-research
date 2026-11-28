@@ -105,11 +105,8 @@ Custom_APP_WorkMode_t Custom_APP_GetConfiguredWorkMode(void);
 void Custom_APP_TxPoolAvailable(void);
 void Custom_APP_Process(void);
 void Custom_APP_ProtocolMtu(uint16_t handle, uint16_t mtu);
-uint8_t Custom_APP_ProtocolStreaming(void);
-/* 网关设置快照：5 个窗口 u32 + 抽取倍数 u16，小端，共 22 字节。 */
-void Custom_APP_ProtocolExportSettings(uint8_t out[22]);
-uint8_t Custom_APP_ProtocolImportSettings(const uint8_t in[22]);
-void Custom_APP_PrepareStop2(void);
+/* Returns 0 while Flash preparation is busy/failed; caller must retry before STOP2. */
+uint8_t Custom_APP_PrepareStop2(void);
 void Custom_APP_ResumeFromStop2(void);
 uint8_t Custom_APP_ZigbeeBeginSnapshot(uint16_t vibration_rate_hz,
   uint16_t vibration_window_ms, uint16_t digital_mic_window_ms,
