@@ -24,6 +24,9 @@
 #include "app_conf.h"
 /* USER CODE BEGIN include */
 #include "main.h"
+#if defined(DEBUG) && defined(__GNUC__) && !defined(__OPTIMIZE__)
+#include <stddef.h>
+#endif
 
 /* USER CODE END include */
 
@@ -53,6 +56,29 @@ void PWR_SetRunModeLock(uint8_t lock);
 /* USER CODE END Private_Function_Prototypes */
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN Private_Typedef */
+#if defined(DEBUG) && defined(__GNUC__) && !defined(__OPTIMIZE__)
+typedef struct
+{
+  uint32_t sequence;
+  uint32_t sp;
+  uint32_t r7;
+  uint32_t lr;
+  uint32_t saved_return;
+} LpmStackSnapshot;
+
+typedef struct
+{
+  uint32_t sequence;
+  uint32_t return_slot;
+  LpmStackSnapshot entry;
+  LpmStackSnapshot after_hsi;
+  LpmStackSnapshot after_flash_latency;
+  LpmStackSnapshot before_hsem_release;
+  LpmStackSnapshot after_hsem_release;
+} LpmStackTrace;
+
+static volatile LpmStackTrace lpm_stack_trace __attribute__((used));
+#endif
 
 /* USER CODE END Private_Typedef */
 /* Private define ------------------------------------------------------------*/
@@ -61,6 +87,49 @@ void PWR_SetRunModeLock(uint8_t lock);
 /* USER CODE END Private_Define */
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN Private_Macro */
+#if defined(DEBUG) && defined(__GNUC__) && !defined(__OPTIMIZE__)
+/* Keep the Debug -O0 EnterLowPower prologue as push {r7, lr}. Anchor all
+   samples to its saved LR slot so later SP changes cannot move the sample. */
+#define LPM_STACK_TRACE_BEGIN()                                                \
+  __asm__ volatile (                                                           \
+    "ldr r0, =lpm_stack_trace\n\t"                                              \
+    "add r1, sp, #4\n\t"                                                       \
+    "str r1, [r0, #%c[slot]]\n\t"                                               \
+    "ldr r1, [r0, #%c[seq]]\n\t"                                                \
+    "adds r1, #1\n\t"                                                          \
+    "str r1, [r0, #%c[seq]]\n\t"                                                \
+    :                                                                          \
+    : [slot] "i" (offsetof(LpmStackTrace, return_slot)),                         \
+      [seq] "i" (offsetof(LpmStackTrace, sequence))                              \
+    : "r0", "r1", "cc", "memory")
+
+/* Commit a sample by writing its sequence last. Only compare snapshots
+   whose sequence matches the current invocation. The trace uses no stack. */
+#define LPM_STACK_TRACE(point)                                                 \
+  __asm__ volatile (                                                           \
+    "ldr r0, =lpm_stack_trace\n\t"                                              \
+    "mov r1, sp\n\t"                                                           \
+    "str r1, [r0, #%c[sp_offset]]\n\t"                                          \
+    "str r7, [r0, #%c[r7_offset]]\n\t"                                          \
+    "str lr, [r0, #%c[lr_offset]]\n\t"                                          \
+    "ldr r1, [r0, #%c[slot]]\n\t"                                               \
+    "ldr r1, [r1]\n\t"                                                          \
+    "str r1, [r0, #%c[ret_offset]]\n\t"                                         \
+    "ldr r1, [r0, #%c[seq]]\n\t"                                                \
+    "str r1, [r0, #%c[point_seq]]\n\t"                                          \
+    :                                                                          \
+    : [slot] "i" (offsetof(LpmStackTrace, return_slot)),                         \
+      [seq] "i" (offsetof(LpmStackTrace, sequence)),                             \
+      [point_seq] "i" (offsetof(LpmStackTrace, point.sequence)),                 \
+      [sp_offset] "i" (offsetof(LpmStackTrace, point.sp)),                       \
+      [r7_offset] "i" (offsetof(LpmStackTrace, point.r7)),                       \
+      [lr_offset] "i" (offsetof(LpmStackTrace, point.lr)),                       \
+      [ret_offset] "i" (offsetof(LpmStackTrace, point.saved_return))             \
+    : "r0", "r1", "memory")
+#else
+#define LPM_STACK_TRACE_BEGIN() ((void)0)
+#define LPM_STACK_TRACE(point) ((void)0)
+#endif
 
 /* USER CODE END Private_Macro */
 /* Private variables ---------------------------------------------------------*/
@@ -168,6 +237,7 @@ void PWR_EnterStopMode(void)
 
   /* Turn off the power LED before entering STOP2. */
   HAL_GPIO_WritePin(LED_BATT_GPIO_Port, LED_BATT_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LED_MEAS_GPIO_Port, LED_MEAS_Pin, GPIO_PIN_SET);
 
 /* USER CODE END PWR_EnterStopMode_1 */
   /**
@@ -199,10 +269,13 @@ void PWR_EnterStopMode(void)
   __force_stores();
 #endif
 
-  __WFI();
-
 /* USER CODE BEGIN PWR_EnterStopMode_2 */
-
+  /* Discard a pending SysTick only. Leave RTC, IPCC and GPIO wakeups pending. */
+  SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;
+  LL_PWR_ClearFlag_C1STOP_C1STB();
+  __DSB();
+  __WFI();
+  Stop2WakeTraceEligible = (uint8_t)LL_PWR_IsActiveFlag_C1STOP();
 /* USER CODE END PWR_EnterStopMode_2 */
   return;
 }
@@ -228,7 +301,6 @@ void PWR_ExitStopMode(void)
   /* STOP2 disables PLLSAI1. Reconfiguring it here may wait on HAL_GetTick(),
      but SysTick cannot run until the sequencer unmasks interrupts. */
   PeriphClocksRestorePending = 1U;
-  Stop2WakeTraceEligible = 1U;
   /* The main system PLL is restored above; turn the run LED back on now. */
   HAL_GPIO_WritePin(LED_BATT_GPIO_Port, LED_BATT_Pin, GPIO_PIN_RESET);
 
@@ -308,6 +380,9 @@ static void EnterLowPower(void)
    * This function is called from CRITICAL SECTION
    */
 
+  LPM_STACK_TRACE_BEGIN();
+  LPM_STACK_TRACE(entry);
+
   while(LL_HSEM_1StepLock(HSEM, CFG_HW_RCC_SEMID));
 
   if (! LL_HSEM_1StepLock(HSEM, CFG_HW_ENTRY_STOP_MODE_SEMID))
@@ -318,17 +393,23 @@ static void EnterLowPower(void)
       LL_HSEM_ReleaseLock(HSEM, CFG_HW_ENTRY_STOP_MODE_SEMID, 0);
 
       Switch_On_HSI();
+      LPM_STACK_TRACE(after_hsi);
       __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
+      LPM_STACK_TRACE(after_flash_latency);
     }
   }
   else
   {
     Switch_On_HSI();
+    LPM_STACK_TRACE(after_hsi);
     __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
+    LPM_STACK_TRACE(after_flash_latency);
   }
 
   /* Release RCC semaphore */
+  LPM_STACK_TRACE(before_hsem_release);
   LL_HSEM_ReleaseLock(HSEM, CFG_HW_RCC_SEMID, 0);
+  LPM_STACK_TRACE(after_hsem_release);
 
   return;
 }

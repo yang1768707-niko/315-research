@@ -17,4 +17,9 @@ static inline void sampling_cadence_change(SamplingCadence *c,uint32_t period) {
 static inline uint32_t sampling_cadence_delay(const SamplingCadence *c,uint32_t now) {
     return (int32_t)(c->next-now)>0?c->next-now:1U;
 }
+/* A reconnect plan changes only the next sampling deadline. Upload scheduling
+ * and the external Flash queue are deliberately independent. */
+static inline void sampling_cadence_resume(SamplingCadence *c,uint32_t now,uint32_t period,uint32_t delay) {
+    c->period=period;c->next=now+delay;c->active=1U;
+}
 #endif

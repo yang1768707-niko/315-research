@@ -464,6 +464,11 @@ uint32_t UTIL_SEQ_IsSchedulableTask( UTIL_SEQ_bm_t TaskId_bm)
     return _status;
 }
 
+uint32_t UTIL_SEQ_HasPendingTask(UTIL_SEQ_bm_t TaskId_bm)
+{
+    return (TaskSet & TaskId_bm) != 0U;
+}
+
 void UTIL_SEQ_PauseTask( UTIL_SEQ_bm_t TaskId_bm )
 {
     UTIL_SEQ_ENTER_CRITICAL_SECTION( );

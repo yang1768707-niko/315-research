@@ -26,19 +26,6 @@ static uint32_t sessions[COMM_LINK_COUNT];
 static uint16_t sequences[COMM_LINK_COUNT];
 static CommExecutor execute;
 static CommWorkModeHandler work_mode_handler;
-static CommExecutedObserver executed_observer;
-static CommCommandFinalizer command_finalizer;
-static CommResponseSubmitted response_submitted;
-
-void Comm_RegisterCommandFinalizer(CommCommandFinalizer finalizer,CommResponseSubmitted submitted) {
-  command_finalizer=finalizer;response_submitted=submitted;
-}
-
-void Comm_RegisterExecutedObserver(CommExecutedObserver observer) {
-  executed_observer=observer;
-}
-
-/* 环形队列及每链路最近一次执行记录：去重范围有限，并非完整历史。 */
 static CommQueued queue[COMM_QUEUE_DEPTH], last[COMM_LINK_COUNT];
 static uint8_t head, count, last_valid[COMM_LINK_COUNT];
 
@@ -180,9 +167,7 @@ void Comm_Process(void) {
         pending->result=work_mode_handler?work_mode_handler(&pending->request,
             &pending->mode_active,&pending->mode_configured):COMM_UNSUPPORTED;
       else pending->result=execute?execute(&pending->request,&pending->mask):COMM_UNSUPPORTED;
-      if(executed_observer)executed_observer(&pending->request,pending->result);
       pending->revision=0U;
-      if(command_finalizer)pending->result=command_finalizer(&pending->request,pending->result,&pending->revision);
       pending->executed=1;
       last[from->link]=*pending;last_valid[from->link]=1;
     }
@@ -203,7 +188,6 @@ void Comm_Process(void) {
     uint16_t bytes=Comm_EncodeFrame(frame,sizeof(frame),COMM_KIND_RESPONSE,q->request.code,q->request.sequence,payload,length);
     CommResult sent=transports[s->link]?transports[s->link](s,frame,bytes):COMM_NOT_READY;
     if(sent==COMM_BUSY)return; /* 只重试响应，不重复执行命令。 */
-    if(sent==COMM_OK && response_submitted)response_submitted(&q->request,q->result,q->revision);
   }
   head=(uint8_t)((head+1)%COMM_QUEUE_DEPTH);count--;
 }
@@ -259,35 +243,11 @@ uint16_t Comm_EncodeWave(uint8_t *out,uint16_t capacity,uint32_t batch,uint32_t 
   return (uint16_t)n;
 }
 
-/* 编码载荷：批次 u32 + X/Y/Z 各 5 个 i32 特征，共 64 字节。
- * 按调用方提供的特征顺序写入，不在这里计算特征或改变缩放值。 */
-uint16_t Comm_EncodeFeatures(uint8_t *out,uint16_t capacity,uint32_t batch,const int32_t features[3][5]) {
-  if(!out || !features || capacity<COMM_FEATURE_PAYLOAD_SIZE)return 0;
-  Comm_WriteU32(out,batch);
-  for(unsigned a=0;a<3;a++)for(unsigned f=0;f<5;f++)Comm_WriteU32(out+4+(a*5+f)*4,(uint32_t)features[a][f]);
-  return COMM_FEATURE_PAYLOAD_SIZE;
-}
-
-/* 标量发送便捷接口：编码批次和 TLV 后调用公共发送函数。 */
 CommResult Comm_SendScalars(CommLink link,uint32_t batch,const CommScalars *v) {
   uint8_t p[24];uint16_t n=Comm_EncodeScalars(p,sizeof(p),batch,v);
   return n?Comm_Send(link,COMM_KIND_DATA,COMM_DATA_SCALARS,p,n):COMM_BAD_VALUE;
 }
 
-/* 波形发送便捷接口；当前实时流用 EncodeWave + SendFrame 保留 BUSY 待发帧。 */
-CommResult Comm_SendWave(CommLink link,uint32_t batch,uint32_t first,const int16_t (*xyz)[3],uint16_t count) {
-  uint8_t p[COMM_FRAME_MAX-COMM_HEADER_SIZE];
-  uint16_t n=Comm_EncodeWave(p,sizeof(p),batch,first,xyz,count);
-  return n?Comm_Send(link,COMM_KIND_DATA,COMM_DATA_WAVE,p,n):COMM_BAD_VALUE;
-}
-
-/* 发送已有振动特征，当前由 Zigbee 快照发布路径调用。 */
-CommResult Comm_SendFeatures(CommLink link,uint32_t batch,const int32_t f[3][5]) {
-  uint8_t p[COMM_FEATURE_PAYLOAD_SIZE];uint16_t n=Comm_EncodeFeatures(p,sizeof(p),batch,f);
-  return n?Comm_Send(link,COMM_KIND_DATA,COMM_DATA_FEATURES,p,n):COMM_BAD_VALUE;
-}
-
-/* 发送状态事件，载荷为状态 u8 + 传感器掩码 u16。 */
 CommResult Comm_SendStatus(CommLink link,uint8_t status,uint16_t mask) {
   uint8_t p[3]={0};p[0]=status;Comm_WriteU16(p+1,mask);
   return Comm_Send(link,COMM_KIND_EVENT,COMM_DATA_STATUS,p,sizeof(p));
@@ -313,9 +273,3 @@ uint16_t Comm_MaskFromBle(uint8_t m) { return (uint16_t)(((m&8)>>3)|((m&7)<<1));
 
 /* 公共标量掩码转旧 BLE 驱动位图；振动位不参与转换。 */
 uint8_t Comm_MaskToBle(uint16_t m) { return (uint8_t)(((m&1)<<3)|((m&14)>>1)); }
-
-/* 转换 A 版旧配置：bit0 振动，bit1/2 数字/模拟麦克风。
- * 旧采集默认包含温度与磁场，返回值总带这两位；不能用于解释新协议掩码。 */
-uint16_t Comm_MaskFromZigbee(uint8_t m) {
-  return COMM_SENSOR_TEMPERATURE|COMM_SENSOR_MAGNETIC|((m&1)?COMM_SENSOR_VIBRATION:0)|((m&6)<<1);
-}

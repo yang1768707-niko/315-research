@@ -2,8 +2,6 @@
  * 所有线上多字节整数均为小端，禁止直接发送 C 结构体以免受对齐/填充影响。
  * 8 字节帧头：版本、类别、功能码、标志、序号 LE16、载荷长度 LE16。
  * BLE：FE82/FE92 接收，FE81 控制/标量，FE91 波形。
- * Zigbee：FC10/E0 接收及响应，FC11/E1 数据/事件。
- * A 版网络控制、可靠 V2 波形上传保留原流程，不等同于 0x81 帧。
  */
 #ifndef COMM_PROTOCOL_H
 #define COMM_PROTOCOL_H
@@ -16,9 +14,6 @@
 #define COMM_HEADER_SIZE             8U
 #define COMM_FRAME_MAX               244U
 #define COMM_COMMAND_MAX             14U
-#define COMM_ZB_CONTROL_COMMAND      0xE0U
-#define COMM_ZB_DATA_COMMAND         0xE1U
-#define COMM_ZB_FRAME_MAX            82U
 
 /* 帧类别：命令、响应、数据、事件。 */
 #define COMM_KIND_COMMAND            1U
@@ -34,18 +29,12 @@
 #define COMM_CMD_WORK_MODE_QUERY     0x24U /* 无载荷，查询当前/保存的 BLE 工作模式 */
 #define COMM_CMD_WORK_MODE_SET       0x25U /* mode:u8，保存后复位生效 */
 /* MCU 上传的数据/事件功能码。 */
+#define COMM_DATA_WAVE               0x81U
 #define COMM_DATA_SCALARS            0x80U /* 批次 u32 + 多个 TLV */
-#define COMM_DATA_WAVE               0x81U /* 批次 u32 + 原始起点 u32 + 点数 u16 + XYZ i16 */
-#define COMM_DATA_FEATURES           0x82U /* 批次 u32 + 三轴各 5 个 i32，特征放大 1000 倍 */
 #define COMM_DATA_STATUS             0x83U /* 状态 u8 + 掩码 u16 */
 #define COMM_DATA_BATCH              0x84U /* 批次 u32 + 采样率 u32 + 抽取倍数 u16 + 灵敏度 u16 */
 #define COMM_DATA_WORK_MODE          0x85U /* result:u8 + active:u8 + configured:u8 */
 /* Zigbee 节点主动交换：结束/就绪事件与网关确认使用同一 code，按 kind 区分。 */
-#define COMM_DATA_GATEWAY_EXCHANGE   0x90U
-#define COMM_GATEWAY_REPORT_SIZE     13U /* token:u32,batch:u32,revision:u32,save_result:u8 */
-#define COMM_GATEWAY_ACK_SIZE        15U /* token,batch,revision,result:u8,sleep_mask:u16 */
-#define COMM_GATEWAY_SLEEP_ALLOWED   0x0001U
-#define COMM_GATEWAY_COMMANDS_PENDING 0x0002U
 
 /* 工作模式只控制 BLE 广播策略；两种链路均可使用统一命令查询/保存。 */
 #define COMM_WORK_MODE_ONLINE        0U
@@ -87,10 +76,9 @@
 
 /* 波形固定前缀 10 字节；特征载荷 4 + 3*5*4 = 64 字节。 */
 #define COMM_WAVE_PREFIX_SIZE        10U
-#define COMM_FEATURE_PAYLOAD_SIZE    64U
 
 /* MCU 内部链路标识，不直接作为线上载荷发送。 */
-typedef enum { COMM_LINK_BLE=0, COMM_LINK_ZIGBEE=1, COMM_LINK_COUNT=2 } CommLink;
+typedef enum { COMM_LINK_BLE=0, COMM_LINK_COUNT=1 } CommLink;
 
 /* 通用结果码。收发函数返回 OK 只表示本地接受/提交，不代表对端收到。
  * 命令响应中的 OK 表示操作完成，配置命令也已保存并回读；不能把入队成功当配置成功。 */
@@ -127,13 +115,8 @@ typedef CommResult (*CommTransport)(const CommSource *, const uint8_t *, uint16_
 /* 执行回调接收已校验请求，输出执行后的活动掩码，返回命令执行结果。 */
 typedef CommResult (*CommExecutor)(const CommRequest *, uint16_t *active_mask);
 /* 完成实际执行后通知应用层；队列重复请求不会重复触发，便于设置保存及版本跟踪。 */
-typedef void (*CommExecutedObserver)(const CommRequest *, CommResult);
-void Comm_RegisterExecutedObserver(CommExecutedObserver observer);
 /* 在执行后、缓存/发送响应前完成配置提交。返回最终结果；响应附带 revision:u32。
  * BLE 或未关联网关轮次时 revision 为0；参数校验失败为 UNKNOWN。不能返回暂定成功。 */
-typedef CommResult (*CommCommandFinalizer)(const CommRequest *, CommResult, uint32_t *revision);
-typedef void (*CommResponseSubmitted)(const CommRequest *, CommResult, uint32_t revision);
-void Comm_RegisterCommandFinalizer(CommCommandFinalizer finalizer, CommResponseSubmitted submitted);
 
 /* 模式执行回调：仅由 Comm_Process 调用，输出当前/保存模式。
  * 模式最终响应载荷为 result、active、configured、revision，共 7 字节。 */
@@ -208,22 +191,8 @@ uint16_t Comm_EncodeScalars(uint8_t *out, uint16_t capacity, uint32_t batch,
 uint16_t Comm_EncodeWave(uint8_t *out, uint16_t capacity, uint32_t batch,
                          uint32_t first, const int16_t (*xyz)[3], uint16_t count);
 
-/* 编码载荷：批次 u32 + X/Y/Z 各 5 个 i32 特征，共 64 字节。
- * 按调用方提供的特征顺序写入，不在这里计算特征或改变缩放值。 */
-uint16_t Comm_EncodeFeatures(uint8_t *out, uint16_t capacity, uint32_t batch,
-                            const int32_t features[3][5]);
-
-/* 标量发送便捷接口：编码批次和 TLV 后调用公共发送函数。 */
 CommResult Comm_SendScalars(CommLink link, uint32_t batch, const CommScalars *values);
 
-/* 波形发送便捷接口；当前实时流用 EncodeWave + SendFrame 保留 BUSY 待发帧。 */
-CommResult Comm_SendWave(CommLink link, uint32_t batch, uint32_t first,
-                         const int16_t (*xyz)[3], uint16_t count);
-
-/* 发送已有振动特征，当前由 Zigbee 快照发布路径调用。 */
-CommResult Comm_SendFeatures(CommLink link, uint32_t batch, const int32_t features[3][5]);
-
-/* 发送状态事件，载荷为状态 u8 + 传感器掩码 u16。 */
 CommResult Comm_SendStatus(CommLink link, uint8_t status, uint16_t mask);
 
 /* 发送批次元信息：批次、原始采样率、抽取倍数、灵敏度。
@@ -241,7 +210,4 @@ uint16_t Comm_MaskFromBle(uint8_t legacy);
 /* 公共标量掩码转旧 BLE 驱动位图；振动位不参与转换。 */
 uint8_t Comm_MaskToBle(uint16_t mask);
 
-/* 转换 A 版旧配置：bit0 振动，bit1/2 数字/模拟麦克风。
- * 旧采集默认包含温度与磁场，返回值总带这两位；不能用于解释新协议掩码。 */
-uint16_t Comm_MaskFromZigbee(uint8_t legacy);
 #endif

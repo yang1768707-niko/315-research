@@ -254,6 +254,9 @@ void UTIL_SEQ_SetTask( UTIL_SEQ_bm_t TaskId_bm, uint32_t Task_Prio );
   */
 uint32_t UTIL_SEQ_IsSchedulableTask( UTIL_SEQ_bm_t TaskId_bm);
 
+/* True if any selected task is queued, including paused tasks. */
+uint32_t UTIL_SEQ_HasPendingTask(UTIL_SEQ_bm_t TaskId_bm);
+
 /**
   * @brief This function prevents a task to be called by the sequencer even when set with UTIL_SEQ_SetTask()
   *        By default, all tasks are executed by the sequencer when set with UTIL_SEQ_SetTask()

@@ -32,12 +32,6 @@ typedef enum
 
 typedef enum
 {
-  SSR_Read_Requested,
-  SSR_Read_Not_Requested
-}RequestReadSSR_t;
-
-typedef enum
-{
   WakeupTimerValue_Overpassed,
   WakeupTimerValue_LargeEnough
 }WakeupTimerLimitation_Status_t;
@@ -67,7 +61,8 @@ typedef struct
 
 static volatile TimerContext_t aTimerContext[CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER];
 static volatile uint8_t CurrentRunningTimerID;
-static volatile uint8_t PreviousRunningTimerID;
+static volatile uint8_t LongAlarmArmed;
+static volatile uint32_t LongAlarmStart;
 static volatile uint32_t SSRValueOnLastSetup;
 static volatile WakeupTimerLimitation_Status_t  WakeupTimerLimitation;
 
@@ -85,12 +80,12 @@ extern RTC_HandleTypeDef hrtc;
 
 /* Private function prototypes -----------------------------------------------*/
 static void RestartWakeupCounter(uint16_t Value);
-static uint16_t ReturnTimeElapsed(void);
+static uint32_t ReturnTimeElapsed(void);
 static void RescheduleTimerList(void);
-static void UnlinkTimer(uint8_t TimerID, RequestReadSSR_t RequestReadSSR);
+static void UnlinkTimer(uint8_t TimerID);
 static void LinkTimerBefore(uint8_t TimerID, uint8_t RefTimerID);
 static void LinkTimerAfter(uint8_t TimerID, uint8_t RefTimerID);
-static uint16_t linkTimer(uint8_t TimerID);
+static void linkTimer(uint8_t TimerID);
 static uint32_t ReadRtcSsrValue(void);
 
 __weak void HW_TS_RTC_CountUpdated_AppNot(void);
@@ -179,10 +174,10 @@ static void LinkTimerBefore(uint8_t TimerID, uint8_t RefTimerID)
  * @param  TimerID:   The ID of the Timer
  * @retval None
  */
-static uint16_t linkTimer(uint8_t TimerID)
+static void linkTimer(uint8_t TimerID)
 {
   uint32_t time_left;
-  uint16_t time_elapsed;
+  uint32_t time_elapsed;
   uint8_t timer_id_lookup;
   uint8_t next_id;
 
@@ -191,12 +186,10 @@ static uint16_t linkTimer(uint8_t TimerID)
     /**
      * No timer in the list
      */
-    PreviousRunningTimerID = CurrentRunningTimerID;
     CurrentRunningTimerID = TimerID;
     aTimerContext[TimerID].NextID = CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER;
 
     SSRValueOnLastSetup = SSR_FORBIDDEN_VALUE;
-    time_elapsed = 0;
   }
   else
   {
@@ -205,7 +198,9 @@ static uint16_t linkTimer(uint8_t TimerID)
     /**
      * update count of the timer to be linked
      */
-    aTimerContext[TimerID].CountLeft += time_elapsed;
+    uint32_t delay = aTimerContext[TimerID].CountLeft;
+    aTimerContext[TimerID].CountLeft =
+        delay > UINT32_MAX - time_elapsed ? UINT32_MAX : delay + time_elapsed;
     time_left = aTimerContext[TimerID].CountLeft;
 
     /**
@@ -235,28 +230,24 @@ static uint16_t linkTimer(uint8_t TimerID)
        * Link before the first ID
        */
       LinkTimerBefore(TimerID, CurrentRunningTimerID);
-      PreviousRunningTimerID = CurrentRunningTimerID;
       CurrentRunningTimerID = TimerID;
     }
   }
 
-  return time_elapsed;
 }
 
 /**
  * @brief  Remove a Timer from the list
  * @param  TimerID:   The ID of the Timer
- * @param  RequestReadSSR: Request to read the SSR register or not
  * @retval None
  */
-static void UnlinkTimer(uint8_t TimerID, RequestReadSSR_t RequestReadSSR)
+static void UnlinkTimer(uint8_t TimerID)
 {
   uint8_t previous_id;
   uint8_t next_id;
 
   if(TimerID == CurrentRunningTimerID)
   {
-    PreviousRunningTimerID = CurrentRunningTimerID;
     CurrentRunningTimerID = aTimerContext[TimerID].NextID;
   }
   else
@@ -276,7 +267,7 @@ static void UnlinkTimer(uint8_t TimerID, RequestReadSSR_t RequestReadSSR)
    */
   aTimerContext[TimerID].TimerIDStatus = TimerID_Created;
 
-  if((CurrentRunningTimerID == CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER) && (RequestReadSSR == SSR_Read_Requested))
+  if(CurrentRunningTimerID == CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER)
   {
     SSRValueOnLastSetup = SSR_FORBIDDEN_VALUE;
   }
@@ -291,10 +282,37 @@ static void UnlinkTimer(uint8_t TimerID, RequestReadSSR_t RequestReadSSR)
  * @param  None
  * @retval Time expired in Ticks
  */
-static uint16_t ReturnTimeElapsed(void)
+static uint32_t ReadRtcCalendarTicks(void)
+{
+  uint32_t time, subseconds;
+  do
+  {
+    time = RTC->TR;
+    subseconds = ReadRtcSsrValue();
+  } while (time != RTC->TR);
+
+  uint32_t hours = 10U * ((time & RTC_TR_HT) >> RTC_TR_HT_Pos) +
+                   ((time & RTC_TR_HU) >> RTC_TR_HU_Pos);
+  uint32_t minutes = 10U * ((time & RTC_TR_MNT) >> RTC_TR_MNT_Pos) +
+                     ((time & RTC_TR_MNU) >> RTC_TR_MNU_Pos);
+  uint32_t seconds = 10U * ((time & RTC_TR_ST) >> RTC_TR_ST_Pos) +
+                     ((time & RTC_TR_SU) >> RTC_TR_SU_Pos);
+  return (hours * 3600U + minutes * 60U + seconds) * SynchPrescalerUserConfig +
+         (SynchPrescalerUserConfig - 1U - subseconds);
+}
+
+static uint32_t ReturnTimeElapsed(void)
 {
   uint32_t  return_value;
   uint32_t  wrap_counter;
+
+  if (LongAlarmArmed)
+  {
+    uint32_t now = ReadRtcCalendarTicks();
+    uint32_t elapsed = now >= LongAlarmStart ? now - LongAlarmStart :
+        86400U * SynchPrescalerUserConfig - LongAlarmStart + now;
+    return (uint32_t)(((uint64_t)elapsed * AsynchPrescalerUserConfig) >> WakeupTimerDivider);
+  }
 
   if(SSRValueOnLastSetup != SSR_FORBIDDEN_VALUE)
   {
@@ -322,7 +340,7 @@ static uint16_t ReturnTimeElapsed(void)
     return_value = 0;
   }
 
-  return (uint16_t)return_value;
+  return return_value;
 }
 
 /**
@@ -392,12 +410,56 @@ static void RestartWakeupCounter(uint16_t Value)
  * @param  None
  * @retval None
  */
+/* The timer server owns Alarm A as well as WUT. RTC write protection is
+ * already disabled at these call sites. */
+static void CancelLongAlarm(void)
+{
+  CLEAR_BIT(RTC->CR, RTC_CR_ALRAE | RTC_CR_ALRAIE);
+  __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+  __HAL_RTC_ALARM_EXTI_CLEAR_FLAG();
+  HAL_NVIC_ClearPendingIRQ(RTC_Alarm_IRQn);
+  LongAlarmArmed = 0U;
+}
+
+static uint8_t StartLongAlarm(uint32_t delay)
+{
+  uint32_t ticks_per_day = 86400U * SynchPrescalerUserConfig;
+  uint64_t alarm_delay = (((uint64_t)delay << WakeupTimerDivider) +
+                         AsynchPrescalerUserConfig - 1U) / AsynchPrescalerUserConfig;
+  /* The date is masked. Only use an alarm if its first match is the target. */
+  if (alarm_delay >= ticks_per_day) return 0U;
+
+  LongAlarmStart = ReadRtcCalendarTicks();
+  uint32_t target = (uint32_t)(((uint64_t)LongAlarmStart + alarm_delay) % ticks_per_day);
+  uint32_t seconds = target / SynchPrescalerUserConfig;
+  RTC_AlarmTypeDef alarm = {0};
+  alarm.Alarm = RTC_ALARM_A;
+  alarm.AlarmDateWeekDay = 1U;
+  alarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+  alarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_NONE;
+  alarm.AlarmTime.Hours = (uint8_t)(seconds / 3600U);
+  alarm.AlarmTime.Minutes = (uint8_t)((seconds / 60U) % 60U);
+  alarm.AlarmTime.Seconds = (uint8_t)(seconds % 60U);
+  alarm.AlarmTime.SubSeconds = SynchPrescalerUserConfig - 1U -
+                              target % SynchPrescalerUserConfig;
+
+  while (!__HAL_RTC_WAKEUPTIMER_GET_FLAG(&hrtc, RTC_FLAG_WUTWF)) {}
+  __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+  __HAL_RTC_WAKEUPTIMER_EXTI_CLEAR_FLAG();
+  HAL_NVIC_ClearPendingIRQ(CFG_HW_TS_RTC_WAKEUP_HANDLER_ID);
+  HAL_StatusTypeDef status = HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN);
+  __HAL_RTC_WRITEPROTECTION_DISABLE(&hrtc);
+  if (status != HAL_OK) return 0U;
+  LongAlarmArmed = 1U;
+  HW_TS_RTC_CountUpdated_AppNot();
+  return 1U;
+}
+
 static void RescheduleTimerList(void)
 {
   uint8_t   localTimerID;
   uint32_t  timecountleft;
-  uint16_t  wakeup_timer_value;
-  uint16_t  time_elapsed;
+  uint32_t  time_elapsed;
 
   /**
    * The wakeuptimer is disabled now to reduce the time to poll the WUTWF
@@ -424,32 +486,8 @@ static void RescheduleTimerList(void)
    */
   time_elapsed = ReturnTimeElapsed();
 
-  if(timecountleft < time_elapsed )
-  {
-    /**
-     * There is no tick left to count
-     */
-    wakeup_timer_value = 0;
-    WakeupTimerLimitation = WakeupTimerValue_LargeEnough;
-  }
-  else
-  {
-    if(timecountleft > (time_elapsed + MaxWakeupTimerSetup))
-    {
-      /**
-       * The number of tick left is greater than the Wakeuptimer maximum value
-       */
-      wakeup_timer_value = MaxWakeupTimerSetup;
-
-      WakeupTimerLimitation = WakeupTimerValue_Overpassed;
-    }
-    else
-    {
-      wakeup_timer_value = timecountleft - time_elapsed;
-      WakeupTimerLimitation = WakeupTimerValue_LargeEnough;
-    }
-
-  }
+  if (LongAlarmArmed) CancelLongAlarm();
+  uint32_t delay = timecountleft > time_elapsed ? timecountleft - time_elapsed : 0U;
 
   /**
    * update ticks left to be counted for each timer
@@ -470,7 +508,14 @@ static void RescheduleTimerList(void)
   /**
    * Write next count
    */
-  RestartWakeupCounter(wakeup_timer_value);
+  WakeupTimerLimitation = WakeupTimerValue_LargeEnough;
+  if (delay > MaxWakeupTimerSetup)
+  {
+    if (StartLongAlarm(delay)) return;
+    delay = MaxWakeupTimerSetup;
+    WakeupTimerLimitation = WakeupTimerValue_Overpassed;
+  }
+  RestartWakeupCounter((uint16_t)delay);
 
   return ;
 }
@@ -484,7 +529,7 @@ static void RescheduleTimerList(void)
  * in case some new implementation is coming in the future
  */
 
-void HW_TS_RTC_Wakeup_Handler(void)
+static void TimerExpired(void)
 {
   HW_TS_pTimerCb_t ptimer_callback;
   uint32_t timer_process_id;
@@ -524,28 +569,13 @@ void HW_TS_RTC_Wakeup_Handler(void)
      */
     if(WakeupTimerLimitation != WakeupTimerValue_Overpassed)
     {
-      if(aTimerContext[local_current_running_timer_id].TimerMode == hw_ts_Repeated)
-      {
-        UnlinkTimer(local_current_running_timer_id, SSR_Read_Not_Requested);
+      uint8_t repeated = aTimerContext[local_current_running_timer_id].TimerMode == hw_ts_Repeated;
+      uint32_t period = aTimerContext[local_current_running_timer_id].CounterInit;
+      HW_TS_Stop(local_current_running_timer_id);
+      if (repeated) HW_TS_Start(local_current_running_timer_id, period);
 #if (CFG_HW_TS_USE_PRIMASK_AS_CRITICAL_SECTION == 1)
-        __set_PRIMASK(primask_bit); /**< Restore PRIMASK bit*/
+      __set_PRIMASK(primask_bit);
 #endif
-        HW_TS_Start(local_current_running_timer_id, aTimerContext[local_current_running_timer_id].CounterInit);
-
-        /* Disable the write protection for RTC registers */
-        __HAL_RTC_WRITEPROTECTION_DISABLE( &hrtc );
-        }
-      else
-      {
-#if (CFG_HW_TS_USE_PRIMASK_AS_CRITICAL_SECTION == 1)
-        __set_PRIMASK(primask_bit); /**< Restore PRIMASK bit*/
-#endif
-        HW_TS_Stop(local_current_running_timer_id);
-
-        /* Disable the write protection for RTC registers */
-        __HAL_RTC_WRITEPROTECTION_DISABLE( &hrtc );
-        }
-
       HW_TS_RTC_Int_AppNot(timer_process_id, local_current_running_timer_id, ptimer_callback);
     }
     else
@@ -558,6 +588,7 @@ void HW_TS_RTC_Wakeup_Handler(void)
   }
   else
   {
+    if (LongAlarmArmed) CancelLongAlarm();
     /**
      * We should never end up in this case
      * However, if due to any bug in the timer server this is the case, the mistake may not impact the user.
@@ -584,6 +615,29 @@ void HW_TS_RTC_Wakeup_Handler(void)
   __HAL_RTC_WRITEPROTECTION_ENABLE( &hrtc );
 
   return;
+}
+
+void HW_TS_RTC_Wakeup_Handler(void)
+{
+  if (LongAlarmArmed)
+  {
+    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    __HAL_RTC_WAKEUPTIMER_EXTI_CLEAR_FLAG();
+    return;
+  }
+  TimerExpired();
+}
+
+void RTC_Alarm_IRQHandler(void)
+{
+  if (LongAlarmArmed && __HAL_RTC_ALARM_GET_FLAG(&hrtc, RTC_FLAG_ALRAF))
+  {
+    TimerExpired();
+  }
+  else
+  {
+    __HAL_RTC_ALARM_EXTI_CLEAR_FLAG();
+  }
 }
 
 void HW_TS_Init(HW_TS_InitMode_t TimerInitMode, RTC_HandleTypeDef *phrtc)
@@ -628,6 +682,7 @@ void HW_TS_Init(HW_TS_InitMode_t TimerInitMode, RTC_HandleTypeDef *phrtc)
 
   if(TimerInitMode == hw_ts_InitMode_Full)
   {
+    CancelLongAlarm();
     WakeupTimerLimitation = WakeupTimerValue_LargeEnough;
     SSRValueOnLastSetup = SSR_FORBIDDEN_VALUE;
 
@@ -663,6 +718,9 @@ void HW_TS_Init(HW_TS_InitMode_t TimerInitMode, RTC_HandleTypeDef *phrtc)
 
   HAL_NVIC_SetPriority(CFG_HW_TS_RTC_WAKEUP_HANDLER_ID, CFG_HW_TS_NVIC_RTC_WAKEUP_IT_PREEMPTPRIO, CFG_HW_TS_NVIC_RTC_WAKEUP_IT_SUBPRIO);   /**<  Set NVIC priority */
   HAL_NVIC_EnableIRQ(CFG_HW_TS_RTC_WAKEUP_HANDLER_ID); /**<  Enable NVIC */
+  HAL_NVIC_SetPriority(RTC_Alarm_IRQn, CFG_HW_TS_NVIC_RTC_WAKEUP_IT_PREEMPTPRIO,
+                      CFG_HW_TS_NVIC_RTC_WAKEUP_IT_SUBPRIO);
+  HAL_NVIC_EnableIRQ(RTC_Alarm_IRQn);
 
   return;
 }
@@ -723,7 +781,6 @@ void HW_TS_Delete(uint8_t timer_id)
 
 void HW_TS_Stop(uint8_t timer_id)
 {
-  uint8_t localcurrentrunningtimerid;
 
 #if (CFG_HW_TS_USE_PRIMASK_AS_CRITICAL_SECTION == 1)
   uint32_t primask_bit;
@@ -741,14 +798,15 @@ void HW_TS_Stop(uint8_t timer_id)
 
   if(aTimerContext[timer_id].TimerIDStatus == TimerID_Running)
   {
-    UnlinkTimer(timer_id, SSR_Read_Requested);
-    localcurrentrunningtimerid = CurrentRunningTimerID;
+    uint8_t was_first = timer_id == CurrentRunningTimerID;
+    UnlinkTimer(timer_id);
 
-    if(localcurrentrunningtimerid == CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER)
+    if(CurrentRunningTimerID == CFG_HW_TS_MAX_NBR_CONCURRENT_TIMER)
     {
       /**
        * List is empty
        */
+      if (LongAlarmArmed) CancelLongAlarm();
 
       /**
        * Disable the timer
@@ -775,7 +833,7 @@ void HW_TS_Stop(uint8_t timer_id)
       __HAL_RTC_WAKEUPTIMER_EXTI_CLEAR_FLAG(); /**<  Clear flag in EXTI module */
       HAL_NVIC_ClearPendingIRQ(CFG_HW_TS_RTC_WAKEUP_HANDLER_ID);   /**<  Clear pending bit in NVIC */
     }
-    else if(PreviousRunningTimerID != localcurrentrunningtimerid)
+    else if(was_first)
     {
       RescheduleTimerList();
     }
@@ -795,8 +853,6 @@ void HW_TS_Stop(uint8_t timer_id)
 
 void HW_TS_Start(uint8_t timer_id, uint32_t timeout_ticks)
 {
-  uint16_t time_elapsed;
-  uint8_t localcurrentrunningtimerid;
 
 #if (CFG_HW_TS_USE_PRIMASK_AS_CRITICAL_SECTION == 1)
   uint32_t primask_bit;
@@ -822,17 +878,11 @@ void HW_TS_Start(uint8_t timer_id, uint32_t timeout_ticks)
   aTimerContext[timer_id].CountLeft = timeout_ticks;
   aTimerContext[timer_id].CounterInit = timeout_ticks;
 
-  time_elapsed =  linkTimer(timer_id);
-
-  localcurrentrunningtimerid = CurrentRunningTimerID;
-
-  if(PreviousRunningTimerID != localcurrentrunningtimerid)
+  uint8_t previous_head = CurrentRunningTimerID;
+  linkTimer(timer_id);
+  if (previous_head != CurrentRunningTimerID)
   {
     RescheduleTimerList();
-  }
-  else
-  {
-    aTimerContext[timer_id].CountLeft -= time_elapsed;
   }
 
   /* Enable the write protection for RTC registers */
@@ -850,12 +900,20 @@ void HW_TS_Start(uint8_t timer_id, uint32_t timeout_ticks)
 uint16_t HW_TS_RTC_ReadLeftTicksToCount(void)
 {
   uint32_t primask_bit;
-  uint16_t return_value, auro_reload_value, elapsed_time_value;
+  uint16_t return_value;
+  uint32_t auro_reload_value, elapsed_time_value;
 
   primask_bit = __get_PRIMASK();  /**< backup PRIMASK bit */
   __disable_irq();                /**< Disable all interrupts by setting PRIMASK bit on Cortex*/
 
-  if((READ_BIT(RTC->CR, RTC_CR_WUTE) == (RTC_CR_WUTE)) == SET)
+  if (LongAlarmArmed)
+  {
+    uint32_t elapsed = ReturnTimeElapsed();
+    uint32_t count = aTimerContext[CurrentRunningTimerID].CountLeft;
+    uint32_t left = count > elapsed ? count - elapsed : 0U;
+    return_value = (uint16_t)(left >= TIMER_LIST_EMPTY ? TIMER_LIST_EMPTY - 1U : left);
+  }
+  else if((READ_BIT(RTC->CR, RTC_CR_WUTE) == (RTC_CR_WUTE)) == SET)
   {
     auro_reload_value = (uint32_t)(READ_BIT(RTC->WUTR, RTC_WUTR_WUT));
 

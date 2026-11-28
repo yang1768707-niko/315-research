@@ -24,6 +24,7 @@ static SAI_HandleTypeDef *s_sai;
 static uint32_t s_dma_buffer[DIGITAL_MIC_DMA_WORDS];
 static volatile uint8_t s_block_flags;
 static volatile uint8_t s_running;
+static uint8_t s_clocks_parked;
 static uint16_t s_warmup_blocks;
 static uint64_t s_sum_squares;
 static uint32_t s_sample_count;
@@ -148,6 +149,19 @@ HAL_StatusTypeDef DigitalMicrophone_Start(void)
     return HAL_OK;
   }
 
+  if (s_clocks_parked != 0U)
+  {
+    GPIO_InitTypeDef gpio = {
+      .Pin = GPIO_PIN_12 | GPIO_PIN_13,
+      .Mode = GPIO_MODE_AF_PP,
+      .Pull = GPIO_NOPULL,
+      .Speed = GPIO_SPEED_FREQ_LOW,
+      .Alternate = GPIO_AF13_SAI1
+    };
+    HAL_GPIO_Init(GPIOB, &gpio);
+    s_clocks_parked = 0U;
+  }
+
   memset(s_dma_buffer, 0, sizeof(s_dma_buffer));
   s_block_flags = 0U;
   s_warmup_blocks = DIGITAL_MIC_WARMUP_BLOCKS;
@@ -196,6 +210,24 @@ void DigitalMicrophone_Stop(void)
     (void)HAL_SAI_DMAStop(s_sai);
   }
   s_block_flags = 0U;
+}
+
+void DigitalMicrophone_PrepareStop2(void)
+{
+  if (s_sai == NULL || s_clocks_parked != 0U) return;
+
+  DigitalMicrophone_Stop();
+  /* ICS-43434 enters sleep with both WS and SCK held low. Preload the GPIO
+     outputs before switching PB12/PB13 away from SAI. */
+  GPIO_InitTypeDef gpio = {
+    .Pin = GPIO_PIN_12 | GPIO_PIN_13,
+    .Mode = GPIO_MODE_OUTPUT_PP,
+    .Pull = GPIO_NOPULL,
+    .Speed = GPIO_SPEED_FREQ_LOW
+  };
+  HAL_GPIO_WritePin(GPIOB, gpio.Pin, GPIO_PIN_RESET);
+  HAL_GPIO_Init(GPIOB, &gpio);
+  s_clocks_parked = 1U;
 }
 
 uint16_t DigitalMicrophone_AppendPayload(uint8_t *buffer, uint16_t buffer_size)

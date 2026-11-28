@@ -8,7 +8,7 @@
 typedef struct {
     uint8_t manifest[SCALAR_MANIFEST_LEN];
     uint32_t next_ms,deadline_ms;
-    uint8_t pending,waiting,attempts,done,error,restart;
+    uint8_t pending,waiting,attempts,done,error,restart,started;
 } ScalarTx;
 typedef struct {
     void *context;
@@ -22,7 +22,9 @@ static inline int scalar_tx_start(ScalarTx *t,const uint8_t *manifest,uint32_t n
     for(unsigned i=0;i<SCALAR_MANIFEST_LEN;i++)copy[i]=manifest[i];
     *t=(ScalarTx){0};
     for(unsigned i=0;i<SCALAR_MANIFEST_LEN;i++)t->manifest[i]=copy[i];
-    t->next_ms=now;t->deadline_ms=now+SCALAR_STALL_MS;
+    /* Preparing a batch is not permission to transmit. Start the stall
+     * budget on the first poll AFTER the caller has a valid upload lease. */
+    t->next_ms=now;
     return 1;
 }
 static inline void scalar_tx_receive(ScalarTx *t,const uint8_t *p,size_t length,uint32_t now)
@@ -45,6 +47,9 @@ static inline int scalar_tx_poll(ScalarTx *t,const ScalarTxIO *io,uint32_t now)
 {
     if(t->done)return 1;
     if(t->error || t->restart)return -1;
+    if(!t->started) {
+        t->started=1;t->next_ms=now;t->deadline_ms=now+SCALAR_STALL_MS;
+    }
     if((int32_t)(now-t->next_ms)<0)return 0;
     if(t->waiting) {
         t->waiting=0;t->deadline_ms=now+SCALAR_STALL_MS;

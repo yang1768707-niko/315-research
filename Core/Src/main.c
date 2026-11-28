@@ -77,6 +77,7 @@ DMA_HandleTypeDef hdma_usart1_tx;
    never programs over this double word: erase its dedicated page first (ECC). */
 static const uint64_t DownloadResetImage
     __attribute__((section(".download_reset"), used, aligned(8))) = DOWNLOAD_RESET_ARMED;
+#include "node_console.h"
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -234,6 +235,7 @@ int main(void)
 
   /* Init code for STM32_WPAN */
   MX_APPE_Init();
+  NodeConsole_Init();
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -777,7 +779,8 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  /* Buffer short command bursts at 921600 while CPU1 services Zigbee work. */
+  if(HAL_UARTEx_EnableFifoMode(&huart1)!=HAL_OK)Error_Handler();
   /* USER CODE END USART1_Init 2 */
 
 }

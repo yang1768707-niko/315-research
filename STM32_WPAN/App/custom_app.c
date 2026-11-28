@@ -215,8 +215,7 @@ static uint8_t VibTxBuffer[DT_VIB_PACKET_SIZE];
 static uint8_t SensorTxBuffer[DT_SENSOR_PACKET_SIZE];
 static uint8_t VibFifoRawBuffer[VIBROMETER_FIFO_DMA_MAX_BYTES];
 static uint8_t SensorTimerId;
-/* Unified stream owner is a routing choice, not a different sensor driver. */
-static CommLink CommStreamLink = COMM_LINK_BLE;
+/* Unified BLE preview uses the existing sensor drivers. */
 static uint8_t CommStreamMode, CommBatchPending, CommDraining, CommDrainStatus;
 static uint32_t CommBleSession, CommBatchId, CommRawIndex;
 static uint8_t CommMtuPending;
@@ -227,9 +226,7 @@ static uint32_t CommWindows[5], CommDeadlines[5];
 static uint16_t CommTimedMask, CommStatusMask;
 static uint16_t CommStatusByCode[5];
 static CommScalars CommFinalScalars;
-static uint8_t CommFinalPending, CommStoredCapture;
-static uint16_t CommStoredMask, CommStoredRequested;
-static uint16_t ZigbeeCaptureMask=COMM_SENSOR_ALL;
+static uint8_t CommFinalPending;
 static uint16_t CommFrameLength;
 static uint8_t CommFrame[COMM_FRAME_MAX];
 static uint8_t CommFrameCode;
@@ -258,7 +255,7 @@ static uint8_t ZigbeeVibrationServicing;
 static uint32_t ZigbeeCaptureWriteMs, ZigbeeCaptureCommittedBytes;
 
 /* The selected BLE policy is applied after reset, not in an active link.
-   RTC BKP19 is unused by this project; no Zigbee NVM/Flash page is touched. */
+   RTC BKP19 is reserved for this mode, separate from Zigbee NVM. */
 static uint8_t DT_ActiveWorkMode;
 static uint8_t DT_ConfiguredWorkMode;
 static uint8_t DT_WorkModeResult;
@@ -360,6 +357,18 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
       DT_WorkModeSendPending = 0U;
       Custom_App_Context.SensorEnableMask = 0U;
       DT_StopSensorStream();
+      if (CommStreamMode)
+      {
+        DT_StopVibStream();
+        CommStreamMode = 0U;
+        CommDraining = 0U;
+        CommTimedMask = 0U;
+        CommFrameLength = 0U;
+        CommBatchPending = 0U;
+        CommFinalPending = 0U;
+        CommStatusMask = 0U;
+        memset(CommStatusByCode, 0, sizeof(CommStatusByCode));
+      }
       /* USER CODE END CUSTOM_STM_SENSOR_STATUS_NOTIFY_DISABLED_EVT */
       break;
 
@@ -376,8 +385,8 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
         CommSource source={COMM_LINK_BLE,CommBleSession};
         (void)Comm_Receive(&source,pNotification->DataTransfered.pPayload,pNotification->DataTransfered.Length);
       } else DT_HandleSensorCtrl(pNotification->DataTransfered.pPayload, pNotification->DataTransfered.Length);
-      /* GATT writes replace FE82's stored bytes. The send task restores its
-         readable status after this HCI event returns. */
+      /* GATT writes replace FE82's stored bytes; restore its readable status
+         from normal main-loop context, never issue nested ACI commands here. */
       DT_WorkModeReadPending = 1U;
       DT_WorkModeReadAttempts = 0U;
       DT_ScheduleWorkMode();
@@ -396,6 +405,14 @@ void Custom_STM_App_Notification(Custom_STM_App_Notification_evt_t *pNotificatio
       /* USER CODE BEGIN CUSTOM_STM_VIB_WAVE_NOTIFY_DISABLED_EVT */
       Custom_App_Context.Vib_wave_Notification_Status = 0U;
       DT_StopVibStream();
+      if (CommStreamMode)
+      {
+        CommDraining = 0U;
+        CommTimedMask &= (uint16_t)~COMM_SENSOR_VIBRATION;
+        if (CommFrameCode == COMM_DATA_WAVE)
+          CommFrameLength = 0U;
+        DT_CommQueueStatus(COMM_STATUS_STOPPED, COMM_SENSOR_VIBRATION);
+      }
       /* USER CODE END CUSTOM_STM_VIB_WAVE_NOTIFY_DISABLED_EVT */
       break;
 
@@ -444,10 +461,9 @@ void Custom_APP_Notification(Custom_App_ConnHandle_Not_evt_t *pNotification)
       /* USER CODE BEGIN CUSTOM_CONN_HANDLE_EVT */
       Custom_App_Context.ConnectionHandle = pNotification->ConnectionHandle;
       if (CommStreamMode) {
-        CommStoredCapture=0;
         DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();DT_StopSensorStream();
       }
-      CommStreamMode=0;CommStreamLink=COMM_LINK_BLE;CommBleCapacity=20U;
+      CommStreamMode=0;CommBleCapacity=20U;
       CommTimedMask=0;CommFrameLength=0;CommStatusMask=0;CommBatchPending=0;
       memset(CommStatusByCode,0,sizeof(CommStatusByCode));CommFinalPending=0;CommDraining=0;
       Comm_SetSession(COMM_LINK_BLE,++CommBleSession);
@@ -471,11 +487,9 @@ void Custom_APP_Notification(Custom_App_ConnHandle_Not_evt_t *pNotification)
     case CUSTOM_DISCON_HANDLE_EVT :
       /* USER CODE BEGIN CUSTOM_DISCON_HANDLE_EVT */
       Comm_SetSession(COMM_LINK_BLE,++CommBleSession);
-      if (CommStreamLink==COMM_LINK_BLE) {
-        CommTimedMask=0;CommFrameLength=0;CommStatusMask=0;CommBatchPending=0;
+      CommTimedMask=0;CommFrameLength=0;CommStatusMask=0;CommBatchPending=0;
       memset(CommStatusByCode,0,sizeof(CommStatusByCode));CommFinalPending=0;CommDraining=0;
-        CommStreamMode=0;
-      }
+      CommStreamMode=0;
       Custom_App_Context.IsConnected = 0U;
       DT_WorkModeSendPending = DT_WorkModeReadPending = 0U;
       if (DT_WorkModeTimerReady != 0U && DT_ModeRestartScheduled == 0U)
@@ -554,6 +568,7 @@ void Custom_APP_Init(void)
                    (QspiNor_IsHighPerformance() != 0U) ? "high-performance" : "standard",
                    (QspiNor_IsQuadProgram() != 0U) ? "1-4-4" : "1-1-1");
     DT_Log(sensor_log);
+    DT_Log("VIB-FLASH: quad read=1-1-4 double-buffer=2x256 local-merge=20261127\r\n");
   }
   else
   {
@@ -630,7 +645,6 @@ void Custom_APP_Process(void)
   if (Comm_HasPending())
     DT_ScheduleWorkMode();
   DT_CommPoll(now);
-  APP_ZIGBEE_GatewayProcess();
 
   /* Reassert active-low LED outputs after every wake and keep them tied to
      the authoritative BLE/Zigbee connection and acquisition state. */
@@ -733,18 +747,76 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
+static uint8_t stop2_i2c_parked;
+static uint8_t stop2_spi_parked;
+
+static void DT_ParkSensorBuses(void)
+{
+  GPIO_InitTypeDef gpio = { .Mode = GPIO_MODE_ANALOG, .Pull = GPIO_NOPULL };
+
+  if (HAL_I2C_GetState(&hi2c3) == HAL_I2C_STATE_READY &&
+      __HAL_I2C_GET_FLAG(&hi2c3, I2C_FLAG_BUSY) == RESET)
+  {
+    gpio.Pin = I2C3_SCL_Pin | I2C3_SDA_Pin;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    __HAL_RCC_I2C3_CLK_DISABLE();
+    stop2_i2c_parked = 1U;
+  }
+
+  if (HAL_SPI_GetState(&hspi1) == HAL_SPI_STATE_READY &&
+      __HAL_SPI_GET_FLAG(&hspi1, SPI_FLAG_BSY) == RESET)
+  {
+    HAL_GPIO_WritePin(CS_ADWB_GPIO_Port, CS_ADWB_Pin, GPIO_PIN_SET);
+    gpio.Pin = GPIO_PIN_4;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    gpio.Pin = GPIO_PIN_3 | GPIO_PIN_5;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_WritePin(GPIOB, (uint16_t)gpio.Pin, GPIO_PIN_RESET);
+    HAL_GPIO_Init(GPIOB, &gpio);
+    __HAL_RCC_SPI1_CLK_DISABLE();
+    stop2_spi_parked = 1U;
+  }
+}
+
+static void DT_RestoreSensorBuses(void)
+{
+  /* Keep the initialized peripheral registers and DMA bindings across STOP2. */
+  GPIO_InitTypeDef gpio = { .Pull = GPIO_NOPULL };
+  if (stop2_i2c_parked != 0U)
+  {
+    __HAL_RCC_I2C3_CLK_ENABLE();
+    gpio.Pin = I2C3_SCL_Pin | I2C3_SDA_Pin;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF4_I2C3;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    stop2_i2c_parked = 0U;
+  }
+  if (stop2_spi_parked != 0U)
+  {
+    __HAL_RCC_SPI1_CLK_ENABLE();
+    gpio.Pin = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF5_SPI1;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    stop2_spi_parked = 0U;
+  }
+}
+
 void QspiNor_ProgramEvent(void)
 {
   if (ZigbeeVibrationWindowActive != 0U)
     UTIL_SEQ_SetTask(1U << CFG_TASK_DT_VIB_DRAIN_ID, CFG_SCH_PRIO_0);
 }
 
-void Custom_APP_PrepareStop2(void)
+uint8_t Custom_APP_PrepareStop2(void)
 {
   /* STOP2 is only selected when DT_UpdateLowPowerLock() confirms that no
      acquisition pipeline is active. Make every external device state
      explicit before the core clock and peripheral clocks are stopped. */
-  DigitalMicrophone_Stop();
+  DigitalMicrophone_PrepareStop2();
   AnalogMicrophone_Stop();
   /* Final board-level assertion: PA9 low disconnects +3.3V_ANA before
      CPU1 enters STOP2. */
@@ -755,15 +827,32 @@ void Custom_APP_PrepareStop2(void)
   }
   (void)Magnetometer_EnterLowPower();
   (void)Thermometer_EnterLowPower();
+  DT_ParkSensorBuses();
+
+  static uint8_t flash_sleep_error_reported;
+  HAL_StatusTypeDef flash_sleep = QspiNor_PrepareStop2();
+  if (flash_sleep == HAL_OK)
+  {
+    flash_sleep_error_reported = 0U;
+  }
+  else if (flash_sleep != HAL_BUSY && flash_sleep_error_reported == 0U)
+  {
+    flash_sleep_error_reported = 1U;
+    DT_Log("VIB-FLASH: deep power-down preparation failed\r\n");
+  }
+
+  if (flash_sleep != HAL_OK) return 0U;
 
   /* PB0/PB1 network LEDs are active-low, so SET turns both LEDs off. */
   HAL_GPIO_WritePin(LED_NET_BLUE_GPIO_Port,
                     LED_NET_BLUE_Pin | LED_NET_RED_Pin,
                     GPIO_PIN_SET);
+  return 1U;
 }
 
 void Custom_APP_ResumeFromStop2(void)
 {
+  DT_RestoreSensorBuses();
   /* Low-speed sensors intentionally stay in standby after a wake-up. Their
      acquisition entry points resume them only when data is actually needed. */
   DT_UpdateStatusLeds();
@@ -799,10 +888,9 @@ uint8_t Custom_APP_ZigbeeBeginSnapshot(uint16_t vibration_rate_hz,
     return 0U;
   }
 
-  /* Common finite commands can select temperature/magnetic independently. */
-  ZigbeeCaptureMask=CommStoredCapture?CommStoredRequested:Comm_MaskFromZigbee(sensor_enable_mask);
-  if(ZigbeeCaptureMask & COMM_SENSOR_MAGNETIC)(void)Magnetometer_ExitLowPower();
-  if(ZigbeeCaptureMask & COMM_SENSOR_TEMPERATURE)(void)Thermometer_ExitLowPower();
+  /* Keep the low-speed sensors awake for the complete snapshot window. */
+  (void)Magnetometer_ExitLowPower();
+  (void)Thermometer_ExitLowPower();
 
   ZigbeeDigitalMicStarted = 0U;
   ZigbeeAnalogMicStarted = 0U;
@@ -964,18 +1052,18 @@ void Custom_APP_ZigbeeFinishSnapshot(Custom_APP_ZigbeeSnapshot_t *snapshot)
   }
 
   (void)memset(snapshot, 0, sizeof(*snapshot));
-  snapshot->scalar_required_mask=CommStoredCapture ? (uint8_t)(CommStoredRequested & COMM_SENSOR_SCALARS) : scalar_expected_mask(ZigbeeSensorEnableMask);
+  snapshot->scalar_required_mask=scalar_expected_mask(ZigbeeSensorEnableMask);
   snapshot->scalar_policy_version=SCALAR_POLICY_VERSION;
   DigitalMicrophone_Process();
   AnalogMicrophone_Process();
 
-  if ((ZigbeeCaptureMask & COMM_SENSOR_TEMPERATURE) && Thermometer_AppendPayload(payload, sizeof(payload)) == 2U)
+  if (Thermometer_AppendPayload(payload, sizeof(payload)) == 2U)
   {
     snapshot->temperature_centi_c = (int16_t)((uint16_t)payload[0] |
                                                ((uint16_t)payload[1] << 8U));
     snapshot->valid_mask |= CUSTOM_APP_ZB_VALID_TEMPERATURE;
   }
-  if ((ZigbeeCaptureMask & COMM_SENSOR_MAGNETIC) && Magnetometer_AppendPayload(payload, sizeof(payload)) == 6U)
+  if (Magnetometer_AppendPayload(payload, sizeof(payload)) == 6U)
   {
     snapshot->magnetic_0p1_ut[0] = (int16_t)((uint16_t)payload[0] |
                                              ((uint16_t)payload[1] << 8U));
@@ -1384,7 +1472,7 @@ static void DT_UpdateStatusLeds(void)
   uint8_t measuring =
       ((Custom_App_Context.SensorStreaming != 0U) ||
        (Custom_App_Context.VibStreaming != 0U) ||
-       (APP_ZIGBEE_IsMeasuring() != 0U) || CommStoredCapture) ? 1U : 0U;
+       (APP_ZIGBEE_IsMeasuring() != 0U)) ? 1U : 0U;
 
   if (network_connected != 0U)
   {
@@ -1431,8 +1519,8 @@ static void DT_SensorTimerCallback(void)
 static void DT_UpdateLowPowerLock(void)
 {
   if ((Custom_App_Context.IsConnected != 0U) ||
+      (DT_ModeRestartScheduled != 0U) ||
       (Comm_HasPending() != 0U) ||
-      (APP_ZIGBEE_WaitingGateway() != 0U) ||
       (APP_ZIGBEE_IsPendingAuthorization() != 0U) ||
       (Custom_App_Context.VibStreaming != 0U) ||
       (ZigbeeAudioWindowActive != 0U) ||
@@ -1625,7 +1713,7 @@ static CommResult DT_CommWorkMode(const CommRequest *request,uint8_t *active,uin
   return (CommResult)DT_WorkModeResult;
 }
 
-/* FE81 events and FE82 readable snapshots share the common frame layout. */
+/* FE82 可读快照与 FE81 主动通知均使用统一协议，不再发送旧 v3 模式 TLV。 */
 static void DT_ProcessWorkMode(uint32_t now)
 {
   tBleStatus status;
@@ -1843,10 +1931,10 @@ static void DT_VibDrainTask(void)
 
 static void DT_SendTask(void)
 {
-  /* Also runs inside the Zigbee startup wait. HCI command masking protects
-     this task from issuing ACI calls while another command is in flight. */
+  /* This HCI-masked task also runs while Zigbee startup waits for events. */
   Comm_Process();
   DT_ServiceWorkModeTask();
+  DT_UpdateLowPowerLock();
   if (CommStreamMode) { DT_CommSendTask(); return; }
   tBleStatus status = BLE_STATUS_SUCCESS;
   uint16_t payload_offset;
@@ -2417,6 +2505,7 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
                      (unsigned long)(capture_elapsed - ZigbeeCaptureWriteMs),
                      (unsigned long)(stats.bytes - ZigbeeCaptureCommittedBytes));
       DT_Log(log_line);
+#if (QSPI_NOR_PROGRAM_TIMING != 0)
       QspiNor_ProgramTiming_t timing = QspiNor_GetProgramTiming();
       (void)snprintf(log_line, sizeof(log_line),
                      "VIB-NOR-CYCLES: hz=%lu pages=%lu setup=%lu tx=%lu poll_delay=%lu poll=%lu done_delay=%lu max_gap=%lu\r\n",
@@ -2429,6 +2518,7 @@ static void DT_ProcessZigbeeVibration(uint32_t now)
                      (unsigned long)timing.completion_delay_cycles,
                      (unsigned long)timing.max_gap_cycles);
       DT_Log(log_line);
+#endif
       DT_UpdateLowPowerLock();
     }
     else
@@ -2605,21 +2695,15 @@ void Custom_APP_ZigbeeAbortSnapshot(void)
 }
 
 /* Unified acquisition adapter: peripheral start/stop functions above remain the
- * sole owners of the sensor drivers. The same command executor serves BLE/ZB. */
+ * sole owners of the sensor drivers. Commands enter through BLE GATT. */
 void Custom_APP_ProtocolMtu(uint16_t handle, uint16_t mtu)
 {
   if (Custom_App_Context.IsConnected && handle==Custom_App_Context.ConnectionHandle && mtu>=23U)
     CommBleCapacity=(mtu-3U>COMM_FRAME_MAX)?COMM_FRAME_MAX:(uint16_t)(mtu-3U);
 }
 
-uint8_t Custom_APP_ProtocolStreaming(void)
-{
-  return CommStreamMode && (DT_CommActiveMask()!=0U || CommDraining || CommStoredCapture);
-}
-
 static uint16_t DT_CommActiveMask(void)
 {
-  if(CommStoredCapture)return CommStoredMask;
   uint16_t mask=Custom_App_Context.SensorStreaming ?
       Comm_MaskFromBle(Custom_App_Context.SensorEnableMask):0U;
   if(Custom_App_Context.VibStreaming && !CommDraining)mask|=COMM_SENSOR_VIBRATION;
@@ -2628,8 +2712,6 @@ static uint16_t DT_CommActiveMask(void)
 
 static uint8_t DT_CommReady(uint8_t vibration)
 {
-  if(CommStreamMode && CommStreamLink==COMM_LINK_ZIGBEE)
-    return APP_ZIGBEE_ProtocolReady();
   return Custom_App_Context.IsConnected &&
       (vibration?Custom_App_Context.Vib_wave_Notification_Status:
                   Custom_App_Context.Sensor_status_Notification_Status);
@@ -2685,8 +2767,6 @@ static CommResult DT_CommExecute(const CommRequest *r,uint16_t *active)
 {
   *active=DT_CommActiveMask();
   if(r->code==COMM_CMD_STATUS) {
-    if(ZigbeeAudioWindowActive || ZigbeeVibrationWindowActive)
-      *active|=Comm_MaskFromZigbee(ZigbeeSensorEnableMask);
     return COMM_OK;
   }
   if(r->code==COMM_CMD_WINDOW) {
@@ -2701,25 +2781,6 @@ static CommResult DT_CommExecute(const CommRequest *r,uint16_t *active)
     CommFactor=r->factor;return COMM_OK;
   }
   if(r->code!=COMM_CMD_SENSOR_ENABLE)return COMM_UNSUPPORTED;
-  if(CommStoredCapture) {
-    if(r->state==COMM_START)return (r->mask & ~CommStoredMask)?COMM_BUSY:COMM_OK;
-    uint16_t stopped=CommStoredMask & r->mask;
-    if(stopped & COMM_SENSOR_VIBRATION) {
-      ZigbeeSensorEnableMask&=(uint8_t)~CUSTOM_APP_ZB_SENSOR_VIBRATION;
-      if(ZigbeeVibrationWindowActive) {
-        ZigbeeVibrationWindowActive=0;Vibrometer_Stop();
-        ZigbeeVibrationStore_Abort();ZigbeeVibrationStoreActive=0;
-      }
-    }
-    if(stopped & COMM_SENSOR_DIGITAL_MIC) {DigitalMicrophone_Stop();ZigbeeDigitalMicStarted=0;}
-    if(stopped & COMM_SENSOR_ANALOG_MIC) {AnalogMicrophone_Stop();ZigbeeAnalogMicStarted=0;}
-    if(stopped & COMM_SENSOR_TEMPERATURE)(void)Thermometer_EnterLowPower();
-    if(stopped & COMM_SENSOR_MAGNETIC)(void)Magnetometer_EnterLowPower();
-    CommStoredMask&=(uint16_t)~stopped;ZigbeeCaptureMask&=(uint16_t)~stopped;
-    CommStoredRequested&=(uint16_t)~stopped;
-    *active=CommStoredMask;DT_CommQueueStatus(COMM_STATUS_STOPPED,stopped);
-    return COMM_OK;
-  }
   /* Scheduled A-version Flash capture is a separate resource owner. Never
    * interrupt it behind its state machine, or corrupt a persisted batch. */
   if(ZigbeeAudioWindowActive || ZigbeeVibrationWindowActive || APP_ZIGBEE_IsMeasuring())return COMM_BUSY;
@@ -2731,36 +2792,18 @@ static CommResult DT_CommExecute(const CommRequest *r,uint16_t *active)
   }
   uint16_t added=r->mask & (uint16_t)~*active;
   if(!added)return COMM_OK; /* retry must not restart a sampling window */
-  if(*active && (!CommStreamMode || CommStreamLink!=r->source.link))return COMM_BUSY;
+  if(*active && !CommStreamMode)return COMM_BUSY;
   if(CommFrameLength || CommStatusMask || CommDraining || CommFinalPending)return COMM_BUSY;
-  if(r->source.link==COMM_LINK_BLE) {
-    if(!Custom_App_Context.IsConnected || !Custom_App_Context.Sensor_status_Notification_Status)
-      return COMM_NOT_READY; /* responses and batch metadata use FE81 */
-    if((added & COMM_SENSOR_SCALARS) && CommBleCapacity<32U)return COMM_NOT_READY;
-    if((added & COMM_SENSOR_VIBRATION) &&
-       (!Custom_App_Context.Vib_wave_Notification_Status || CommBleCapacity<26U))return COMM_NOT_READY;
-  } else if(!APP_ZIGBEE_ProtocolReady() || APP_ZIGBEE_IsPendingAuthorization() || APP_ZIGBEE_IsTransmitting())return COMM_NOT_READY;
-  if(r->source.link==COMM_LINK_ZIGBEE && (added & COMM_SENSOR_VIBRATION) &&
-      CommWindows[4] && CommFactor==1U && !*active) {
-    uint32_t window=CommWindows[4];
-    uint32_t dmic=CommWindows[2]?CommWindows[2]:500U;
-    uint32_t amic=CommWindows[3]?CommWindows[3]:500U;
-    if((window!=500U && window!=1000U && window!=1500U) ||
-       ((added & COMM_SENSOR_DIGITAL_MIC) && dmic!=500U && dmic!=1000U && dmic!=1500U && dmic!=2000U) ||
-       ((added & COMM_SENSOR_ANALOG_MIC) && amic!=500U && amic!=1000U && amic!=1500U && amic!=2000U))return COMM_BAD_VALUE;
-    CommStreamMode=1U;CommStreamLink=r->source.link;CommStoredCapture=1U;
-    CommStoredRequested=CommStoredMask=added;CommBatchId=APP_ZIGBEE_ProtocolNextBatch();
-    uint8_t legacy=1U | ((added&COMM_SENSOR_DIGITAL_MIC)?2U:0U) | ((added&COMM_SENSOR_ANALOG_MIC)?4U:0U);
-    if(!Custom_APP_ZigbeeBeginSnapshot(COMM_VIB_RATE_HZ,(uint16_t)window,(uint16_t)dmic,(uint16_t)amic,legacy,CommBatchId)) {
-      CommStoredCapture=0;DT_AbortZigbeeSnapshot();*active=0;return COMM_HARDWARE_ERROR;
-    }
-    *active=added;DT_CommQueueStatus(COMM_STATUS_SAMPLING,added);return COMM_OK;
-  }
-  CommStreamMode=1U;CommStreamLink=r->source.link;
-  if(!*active) {CommBatchId=APP_ZIGBEE_ProtocolNextBatch();CommBatchPending=1U;CommActiveFactor=CommFactor;}
+  if(!Custom_App_Context.IsConnected || !Custom_App_Context.Sensor_status_Notification_Status)
+    return COMM_NOT_READY;
+  if((added & COMM_SENSOR_SCALARS) && CommBleCapacity<32U)return COMM_NOT_READY;
+  if((added & COMM_SENSOR_VIBRATION) &&
+     (!Custom_App_Context.Vib_wave_Notification_Status || CommBleCapacity<26U))return COMM_NOT_READY;
+  CommStreamMode=1U;
+  if(!*active) {++CommBatchId;CommBatchPending=1U;CommActiveFactor=CommFactor;}
   if(added & COMM_SENSOR_VIBRATION) {
     /* Starting a new waveform establishes its own immutable index/rate. */
-    if(*active) {CommBatchId=APP_ZIGBEE_ProtocolNextBatch();CommBatchPending=1U;}
+    if(*active) {++CommBatchId;CommBatchPending=1U;}
     CommRawIndex=0;CommPhase=0;CommActiveFactor=CommFactor;
     DT_StartVibStream();
   }
@@ -2784,21 +2827,6 @@ static CommResult DT_CommExecute(const CommRequest *r,uint16_t *active)
 static void DT_CommPoll(uint32_t now)
 {
   if(!CommStreamMode)return;
-  if(CommStoredCapture && Custom_APP_ZigbeeSnapshotReady()) {
-    Custom_APP_ZigbeeSnapshot_t snapshot;
-    Custom_APP_ZigbeeFinishSnapshot(&snapshot);
-    uint16_t completed=CommStoredMask;
-    CommStoredCapture=0;CommStoredMask=0;
-    CommResult committed=APP_ZIGBEE_ProtocolSubmit(CommBatchId,&snapshot);
-    uint16_t valid=snapshot.valid_mask & completed;
-    if(committed!=COMM_OK)valid=0;
-    DT_CommQueueStatus(COMM_STATUS_COMPLETE,valid);
-    DT_CommQueueStatus(COMM_STATUS_FAULT,completed & (uint16_t)~valid);
-  }
-  if(CommStoredCapture) {
-    if(CommStatusMask)UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
-    return;
-  }
   uint16_t expired=0;
   for(unsigned i=0;i<5;i++)if((CommTimedMask&(1U<<i)) && (int32_t)(now-CommDeadlines[i])>=0)
     expired|=(uint16_t)(1U<<i);
@@ -2811,9 +2839,6 @@ static void DT_CommPoll(uint32_t now)
     DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();CommDraining=0;CommFrameLength=0;
     DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_ALL);
   }
-  /* Existing BLE loop handles its audio; Zigbee's common stream uses the same
-   * processing function even without a phone connection. */
-  if(CommStreamLink==COMM_LINK_ZIGBEE)DT_ProcessBleAudio(now);
   if((DT_CommActiveMask() || CommDraining || CommFinalPending || CommFrameLength || CommStatusMask || CommBatchPending ||
       Custom_App_Context.SensorSendPending) && (int32_t)(now-CommRetryAt)>=0)
     UTIL_SEQ_SetTask(1U<<CFG_TASK_DT_SEND_ID,CFG_SCH_PRIO_1);
@@ -2845,24 +2870,24 @@ static void DT_CommSendTask(void)
   CommResult result;
   /* A batch description must precede every waveform. Retain it on congestion. */
   if(CommBatchPending) {
-    result=Comm_SendBatch(CommStreamLink,CommBatchId,CommActiveFactor);
+    result=Comm_SendBatch(COMM_LINK_BLE,CommBatchId,CommActiveFactor);
     if(result==COMM_OK)CommBatchPending=0;
     return;
   }
   if(CommFinalPending && !CommFrameLength) {
-    result=Comm_SendScalars(CommStreamLink,CommBatchId,&CommFinalScalars);
+    result=Comm_SendScalars(COMM_LINK_BLE,CommBatchId,&CommFinalScalars);
     if(result==COMM_OK)CommFinalPending=0;
     return;
   }
   if(CommStatusMask && !CommFrameLength) {
     for(unsigned status=0;status<5;status++)if(CommStatusByCode[status]) {
-      result=Comm_SendStatus(CommStreamLink,(uint8_t)status,CommStatusByCode[status]);
+      result=Comm_SendStatus(COMM_LINK_BLE,(uint8_t)status,CommStatusByCode[status]);
       if(result==COMM_OK) {CommStatusMask&=(uint16_t)~CommStatusByCode[status];CommStatusByCode[status]=0;}
       break;
     }
     return;
   }
-  uint16_t capacity=CommStreamLink==COMM_LINK_BLE?CommBleCapacity:COMM_ZB_FRAME_MAX;
+  uint16_t capacity=CommBleCapacity;
   if(!CommFrameLength && Custom_App_Context.SensorSendPending) {
     CommScalars values;DT_CommCollectScalars(&values);
     uint16_t n=Comm_EncodeScalars(CommFrame+COMM_HEADER_SIZE,sizeof(CommFrame)-COMM_HEADER_SIZE,CommBatchId,&values);
@@ -2921,7 +2946,7 @@ static void DT_CommSendTask(void)
         Custom_App_Context.VibSeq++,CommFrame+COMM_HEADER_SIZE,n);
   }
   if(!CommFrameLength)return;
-  result=Comm_SendFrame(CommStreamLink,CommFrame,CommFrameLength);
+  result=Comm_SendFrame(COMM_LINK_BLE,CommFrame,CommFrameLength);
   if(result==COMM_OK) {
     CommFrameLength=0;
     /* Drain promptly while stack buffers allow it; other sequencer tasks run
@@ -2933,18 +2958,4 @@ static void DT_CommSendTask(void)
     CommFrameLength=0;DT_CommStop(COMM_SENSOR_ALL);DT_StopVibStream();CommDraining=0;
     DT_CommQueueStatus(COMM_STATUS_FAULT,COMM_SENSOR_ALL);
   }
-}
-
-/* 配置按字节序列保存，避免结构体填充；导入先完整校验，失败不部分覆盖。 */
-void Custom_APP_ProtocolExportSettings(uint8_t out[22])
-{
-  for(unsigned i=0;i<5;i++)Comm_WriteU32(out+4*i,CommWindows[i]);
-  Comm_WriteU16(out+20,CommFactor);
-}
-uint8_t Custom_APP_ProtocolImportSettings(const uint8_t in[22])
-{
-  if(!in || !Comm_ReadU16(in+20) || Comm_ReadU16(in+20)>COMM_MAX_DECIMATION)return 0;
-  for(unsigned i=0;i<5;i++)if(Comm_ReadU32(in+4*i)>COMM_MAX_WINDOW_MS)return 0;
-  for(unsigned i=0;i<5;i++)CommWindows[i]=Comm_ReadU32(in+4*i);
-  CommFactor=Comm_ReadU16(in+20);return 1;
 }

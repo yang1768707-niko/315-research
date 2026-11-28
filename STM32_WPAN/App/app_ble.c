@@ -492,6 +492,7 @@ void APP_BLE_Init(void)
   /* USER CODE BEGIN APP_BLE_Init_2 */
 #endif
   APP_ZIGBEE_Init();
+  APP_ZIGBEE_SetBleRadioIdle(0U);
   UTIL_SEQ_SetTask(1U << CFG_TASK_BLE_ADV_START_ID, CFG_SCH_PRIO_1);
 
   /* USER CODE END APP_BLE_Init_2 */
@@ -1389,6 +1390,7 @@ static void DT_BLE_StartAdvertisingTask(void)
      continuing BLE broadcast, while CPU2 can sleep between Zigbee events. */
   UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_BLE, UTIL_LPM_DISABLE);
 
+  APP_ZIGBEE_SetBleRadioIdle(0U);
   DT_BLE_TimestampLog("BLE: advertising task start\r\n");
 
   BleApplicationContext.BleApplicationContext_legacy.advtServUUID[0] = 0U;
@@ -1435,6 +1437,8 @@ static void DT_BLE_StartAdvertisingTask(void)
   else
   {
     AdvTimerAction = DT_ADV_TIMER_IDLE;
+    BleApplicationContext.Device_Connection_Status = APP_BLE_IDLE;
+    APP_ZIGBEE_SetBleRadioIdle(1U);
     APP_ZIGBEE_SetCommissioningWindow(0U);
     UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_BLE, UTIL_LPM_ENABLE);
     HAL_UART_Transmit(&huart1,
@@ -1514,6 +1518,7 @@ static void Adv_Cancel(void)
       BleApplicationContext.Device_Connection_Status = APP_BLE_IDLE;
       AdvRetryCount = 0U;
       AdvTimerAction = DT_ADV_TIMER_IDLE;
+      APP_ZIGBEE_SetBleRadioIdle(1U);
       APP_ZIGBEE_SetCommissioningWindow(0U);
       UTIL_LPM_SetStopMode(1U << CFG_LPM_APP_BLE, UTIL_LPM_ENABLE);
       APP_DBG_MSG("  \r\n\r");

@@ -68,6 +68,8 @@ PLACE_IN_SECTION("MB_MEM2") ALIGN(4) static uint8_t BleSpareEvtBuffer[sizeof(TL_
 /* USER CODE BEGIN PV */
 extern UART_HandleTypeDef huart1;
 static uint8_t Stop2SensorsPrepared;
+static uint8_t Stop2SensorsReady;
+static uint8_t SequencerWaitDepth;
 static uint32_t RtcTimebaseOriginMs;
 static uint32_t RtcTimebaseOffsetMs;
 static uint8_t RtcTimebaseReady;
@@ -299,6 +301,12 @@ static void SystemPower_Config(void)
    * Select HSI as system clock source after Wake Up from Stop mode
    */
   LL_RCC_SetClkAfterWakeFromStop(LL_RCC_STOP_WAKEUPCLOCK_HSI);
+
+  /* Allow the system to drop the debug clocks in low-power modes. SWD
+     remains available while running and when connecting under reset. */
+  HAL_DBGMCU_DisableDBGSleepMode();
+  HAL_DBGMCU_DisableDBGStopMode();
+  HAL_DBGMCU_DisableDBGStandbyMode();
 
   /* Initialize low power manager */
   UTIL_LPM_Init();
@@ -641,13 +649,14 @@ uint32_t APP_ElapsedMs(void)
 void UTIL_SEQ_PreIdle(void)
 {
 #if (CFG_LPM_SUPPORTED == 1)
-  Stop2SensorsPrepared = 0U;
+  if (SequencerWaitDepth != 0U) return;
+  Stop2SensorsPrepared = Stop2SensorsReady = 0U;
   if (UTIL_LPM_GetMode() == UTIL_LPM_STOPMODE)
   {
     /* The sequencer calls PreIdle with interrupts enabled, then rechecks
        pending tasks under its idle critical section. Sensor SPI/I2C HAL
        transactions must run here, not in Idle where SysTick is masked. */
-    Custom_APP_PrepareStop2();
+    Stop2SensorsReady = Custom_APP_PrepareStop2();
     Stop2SensorsPrepared = 1U;
   }
 #endif
@@ -656,6 +665,17 @@ void UTIL_SEQ_PreIdle(void)
 void UTIL_SEQ_Idle(void)
 {
 #if (CFG_LPM_SUPPORTED == 1)
+  if (SequencerWaitDepth != 0U && UTIL_LPM_GetMode() == UTIL_LPM_STOPMODE)
+  {
+    /* A nested command wait cannot prepare the board or pause the MAC. */
+    PWR_EnterSleepMode();
+    PWR_ExitSleepMode();
+    return;
+  }
+  /* PreIdle ran with interrupts enabled. Do not sleep after a busy/failed
+     Flash transfer: return to the main loop and retry with SysTick running. */
+  if (UTIL_LPM_GetMode() == UTIL_LPM_STOPMODE && Stop2SensorsReady == 0U)
+    return;
   UTIL_LPM_EnterLowPower();
 #endif
   return;
@@ -665,7 +685,7 @@ void UTIL_SEQ_PostIdle(void)
 {
 #if (CFG_LPM_SUPPORTED == 1)
   PWR_CompleteStopModeWakeup();
-  if (Stop2SensorsPrepared != 0U)
+  if (SequencerWaitDepth == 0U && Stop2SensorsPrepared != 0U)
   {
     Stop2SensorsPrepared = 0U;
     /* This also restores LEDs if a task arrived during PreIdle and the
@@ -696,6 +716,7 @@ void shci_cmd_resp_wait(uint32_t timeout)
 /* USER CODE BEGIN FD_WRAP_FUNCTIONS */
 void UTIL_SEQ_EvtIdle(UTIL_SEQ_bm_t task_id_bm, UTIL_SEQ_bm_t evt_waited_bm)
 {
+  ++SequencerWaitDepth;
   if (g_ot_notification_allowed != 0U)
   {
     UTIL_SEQ_Run(1U << CFG_TASK_NOTIFY_FROM_M0_TO_M4);
@@ -718,6 +739,7 @@ void UTIL_SEQ_EvtIdle(UTIL_SEQ_bm_t task_id_bm, UTIL_SEQ_bm_t evt_waited_bm)
       break;
   }
 
+  --SequencerWaitDepth;
   UNUSED(task_id_bm);
 }
 /* USER CODE END FD_WRAP_FUNCTIONS */

@@ -1,5 +1,7 @@
 # 统一通信协议 v1
 
+> 版本范围（2026-11-28）：下文保留导入 Git 版本的设计记录。当前分支的 Zigbee 保留现用网关协议，以 `Core/Inc/gateway_exchange_wire.h`、`control_sync.h` 和 `app_zigbee.c` 为准。下文通用 Zigbee 命令、接口和配套测试不代表当前实现；本次融合范围见 [融合说明](MERGE_BLE_QSPI_20261127.md)。
+
 适用工程：STM32WB55RGV6-BLE-Zigbee（A版）。本文件描述新增统一协议入口，
 不是声称旧 BLE v3 和 Zigbee HY v3 的全部字节已被替换。
 

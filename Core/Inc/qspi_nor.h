@@ -7,6 +7,11 @@
 #define QSPI_NOR_SECTOR_SIZE 4096U
 #define QSPI_NOR_PAGE_SIZE   256U
 
+/* Enable only for cycle profiling; ordinary low-power runs leave DWT disabled. */
+#ifndef QSPI_NOR_PROGRAM_TIMING
+#define QSPI_NOR_PROGRAM_TIMING 0
+#endif
+
 typedef struct
 {
   uint32_t clock_hz;
@@ -20,6 +25,7 @@ typedef struct
 } QspiNor_ProgramTiming_t;
 
 HAL_StatusTypeDef QspiNor_Init(uint32_t *jedec_id, uint32_t *capacity_bytes);
+HAL_StatusTypeDef QspiNor_PrepareStop2(void);
 HAL_StatusTypeDef QspiNor_EraseRange(uint32_t address, uint32_t length);
 HAL_StatusTypeDef QspiNor_Write(uint32_t address, const uint8_t *data, uint32_t length);
 HAL_StatusTypeDef QspiNor_Read(uint32_t address, uint8_t *data, uint32_t length);

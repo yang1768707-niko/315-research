@@ -15,6 +15,7 @@ HAL_StatusTypeDef DigitalMicrophone_ConfigureWindow(uint16_t window_ms);
 HAL_StatusTypeDef DigitalMicrophone_Start(void);
 void DigitalMicrophone_Process(void);
 void DigitalMicrophone_Stop(void);
+void DigitalMicrophone_PrepareStop2(void);
 uint16_t DigitalMicrophone_AppendPayload(uint8_t *buffer, uint16_t buffer_size);
 uint32_t DigitalMicrophone_GetDroppedBlocks(void);
 uint8_t DigitalMicrophone_IsRunning(void);
